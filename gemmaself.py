@@ -1,0 +1,289 @@
+# meta developer: @Huai_Baike
+
+__version__ = (4, 0, 0)
+
+import asyncio
+import hashlib
+import logging
+import time
+
+import aiohttp
+from .. import loader, utils
+
+logger = logging.getLogger(__name__)
+
+_MSG_CHAR_LIMIT   = 300   # макс символів одного повідомлення в історії
+_SUMMARY_CHAR_LIMIT = 400 # макс символів summary старих повідомлень
+_SUMMARY_ITEM_LIMIT = 80  # макс символів одного рядка у summary
+
+
+# ── Prompt builder ────────────────────────────────────────────────────────────
+
+class _PromptCache:
+    """
+    Кешує зібраний system prompt.
+    Перебудовує тільки якщо конфіг змінився (порівняння по hash).
+    """
+    __slots__ = ("_hash", "_prompt")
+
+    def __init__(self):
+        self._hash   = ""
+        self._prompt = ""
+
+    def get(self, cfg: dict) -> str:
+        # Мінімальний ключ — тільки змістовні поля
+        raw = "".join([
+            cfg["system_prompt"],
+            cfg["style"],
+            cfg["personality"],
+            cfg["behavior"],
+        ])
+        h = hashlib.md5(raw.encode(), usedforsecurity=False).hexdigest()
+        if h != self._hash:
+            self._hash   = h
+            self._prompt = _build_system_prompt(cfg)
+        return self._prompt
+
+
+def _build_system_prompt(cfg: dict) -> str:
+    """
+    Будує компактний system prompt.
+    Замість 4 окремих блоків з заголовками — один щільний абзац.
+    Менше службових токенів (заголовки СТИЛЬ/ПОВЕДІНКА тощо), більше змісту.
+    """
+    who   = cfg["system_prompt"].strip().rstrip(".")
+    style = cfg["style"].strip().rstrip(".")
+    pers  = cfg["personality"].strip().rstrip(".")
+    behav = cfg["behavior"].strip().rstrip(".")
+
+    return (
+        f"{who}. {pers}. "
+        f"{behav}. "
+        f"{style}."
+    )
+
+
+# ── History helpers ───────────────────────────────────────────────────────────
+
+def _truncate(text: str, limit: int) -> str:
+    text = text.strip()
+    return text if len(text) <= limit else text[:limit].rstrip() + "…"
+
+
+def _compress_history(messages: list, keep_recent: int) -> list:
+    """
+    Старі повідомлення → один system-рядок summary.
+    Нові keep_recent — відправляються як є.
+    Результат: мінімальний payload при збереженні контексту.
+    """
+    if len(messages) <= keep_recent:
+        return messages
+
+    old    = messages[:-keep_recent]
+    recent = messages[-keep_recent:]
+
+    parts = []
+    for m in old:
+        label = "Я" if m["role"] == "assistant" else "Юзер"
+        parts.append(f"{label}: {_truncate(m['content'], _SUMMARY_ITEM_LIMIT)}")
+
+    summary = _truncate(" | ".join(parts), _SUMMARY_CHAR_LIMIT)
+    return [
+        {"role": "system", "content": f"[Раніше: {summary}]"},
+        *recent,
+    ]
+
+
+# ── Rate limiter ──────────────────────────────────────────────────────────────
+
+class _RateLimiter:
+    """По одному запиту на чат. Решта отримує 'busy'."""
+
+    def __init__(self):
+        self._locks: dict[int, asyncio.Lock] = {}
+
+    def get(self, chat_id: int) -> asyncio.Lock:
+        if chat_id not in self._locks:
+            self._locks[chat_id] = asyncio.Lock()
+        return self._locks[chat_id]
+
+
+# ── Module ────────────────────────────────────────────────────────────────────
+
+@loader.tds
+class GemmaSelf(loader.Module):
+    """ШІ-двійник на базі Ollama"""
+
+    strings = {
+        "name": "GemmaSelf",
+        "added":   "✅ <b>Чат додано до білого списку</b>",
+        "removed": "❌ <b>Чат видалено з білого списку</b>",
+        "cleared": "🗑 <b>Історію чату очищено</b>",
+        "busy":    "⏳ Зачекай, ще обробляю попереднє повідомлення…",
+    }
+
+    def __init__(self):
+        self.config = loader.ModuleConfig(
+            loader.ConfigValue("allowed_chats", [], "Список ID чатів"),
+            loader.ConfigValue("api_url", "http://localhost:11434/v1", "URL Ollama"),
+            loader.ConfigValue("model", "gemma3-limited:latest", "Назва моделі"),
+            loader.ConfigValue(
+                "system_prompt",
+                "Ти — Станіслав (Стас). Відповідаєш у Telegram від свого імені. "
+                "Розробник Telegram-ботів і backend систем. Працюєш з Python, aiogram, "
+                "hydrogram, Linux/VPS і Debian. Власні проєкти під брендом RotKranz.",
+                "Хто ти",
+            ),
+            loader.ConfigValue(
+                "style",
+                "Пиши як звичайна людина в Telegram: 1-2 речення, без markdown і форматування.",
+                "Стиль",
+            ),
+            loader.ConfigValue(
+                "personality",
+                "Спокійний, технічний, трохи іронічний. Думаєш як програміст. Не любиш воду.",
+                "Характер",
+            ),
+            loader.ConfigValue(
+                "behavior",
+                "Відповідай як реальна людина. Не кажи що ти AI. Можна вживати repo, bot, server.",
+                "Поведінка",
+            ),
+            loader.ConfigValue("max_history",  20, "Максимум повідомлень в історії"),
+            loader.ConfigValue("keep_recent",   6, "Скільки останніх не стискати"),
+            loader.ConfigValue("max_tokens",  120, "Ліміт токенів відповіді"),
+            loader.ConfigValue("timeout",     120, "Таймаут запиту (секунди)"),
+        )
+        self._me      = None
+        self._rl      = _RateLimiter()
+        self._session = None
+        self._pcache  = _PromptCache()
+
+    async def client_ready(self, client, db):
+        self._me      = await client.get_me()
+        self._session = aiohttp.ClientSession()
+
+    async def on_unload(self):
+        if self._session:
+            await self._session.close()
+
+    # ── Storage ───────────────────────────────────────────────────────────
+
+    def _get_history(self, chat_id: int) -> list:
+        return self.get("history", {}).get(str(chat_id), [])
+
+    def _save_history(self, chat_id: int, messages: list):
+        history = self.get("history", {})
+        history[str(chat_id)] = messages[-self.config["max_history"]:]
+        self.set("history", history)
+
+    def _append(self, chat_id: int, role: str, content: str):
+        msgs = self._get_history(chat_id)
+        msgs.append({"role": role, "content": _truncate(content, _MSG_CHAR_LIMIT)})
+        self._save_history(chat_id, msgs)
+
+    # ── AI ────────────────────────────────────────────────────────────────
+
+    async def _call_ollama(self, history: list):
+        url       = f"{self.config['api_url'].rstrip('/')}/chat/completions"
+        system    = self._pcache.get(dict(self.config))   # з кешу, не перебудовує щоразу
+        compressed = _compress_history(history, self.config["keep_recent"])
+
+        payload = {
+            "model":      self.config["model"],
+            "max_tokens": self.config["max_tokens"],
+            "temperature": 0.8,
+            "messages": [
+                {"role": "system", "content": system},
+                *compressed,
+            ],
+        }
+
+        t0 = time.monotonic()
+        try:
+            timeout = aiohttp.ClientTimeout(total=self.config["timeout"])
+            async with self._session.post(url, json=payload, timeout=timeout) as resp:
+                data = await resp.json()
+                logger.debug("GemmaSelf: %.1fс", time.monotonic() - t0)
+                return data["choices"][0]["message"]["content"].strip()
+        except asyncio.TimeoutError:
+            logger.warning("GemmaSelf: таймаут")
+        except Exception as e:
+            logger.error("GemmaSelf: %s", e)
+        return None
+
+    # ── Commands ──────────────────────────────────────────────────────────
+
+    @loader.command()
+    async def gmself(self, message):
+        """Додати/видалити поточний чат з білого списку"""
+        chat_id = message.chat_id
+        allowed = list(self.config["allowed_chats"])
+
+        if chat_id in allowed:
+            allowed.remove(chat_id)
+            self.config["allowed_chats"] = allowed
+            msg = await utils.answer(message, self.strings["removed"])
+        else:
+            allowed.append(chat_id)
+            self.config["allowed_chats"] = allowed
+            msg = await utils.answer(message, self.strings["added"])
+
+        await asyncio.sleep(2)
+        await (msg[0] if isinstance(msg, list) else msg).delete()
+
+    @loader.command()
+    async def gmclear(self, message):
+        """Очистити історію поточного чату"""
+        self._save_history(message.chat_id, [])
+        msg = await utils.answer(message, self.strings["cleared"])
+        await asyncio.sleep(2)
+        await (msg[0] if isinstance(msg, list) else msg).delete()
+
+    # ── Watcher ───────────────────────────────────────────────────────────
+
+    async def watcher(self, message):
+        if not hasattr(message, "out") or message.out or not getattr(message, "text", None):
+            return
+
+        chat_id = message.chat_id
+        if chat_id not in self.config["allowed_chats"]:
+            return
+
+        is_private    = getattr(message, "is_private", False)
+        is_reply_to_me = False
+        if message.is_reply:
+            try:
+                reply = await message.get_reply_message()
+                if reply and self._me and reply.sender_id == self._me.id:
+                    is_reply_to_me = True
+            except Exception:
+                pass
+
+        if not is_private and not is_reply_to_me:
+            return
+
+        lock = self._rl.get(chat_id)
+        if lock.locked():
+            await message.reply(self.strings["busy"])
+            return
+
+        async with lock:
+            name = "Друже"
+            try:
+                sender = await message.get_sender()
+                name   = getattr(sender, "first_name", None) or "Друже"
+            except Exception:
+                pass
+
+            self._append(chat_id, "user", f"{name}: {message.text}")
+
+            try:
+                async with message.client.action(chat_id, "typing"):
+                    response = await self._call_ollama(self._get_history(chat_id))
+
+                if response:
+                    await message.reply(response)
+                    self._append(chat_id, "assistant", response)
+            except Exception as e:
+                logger.error("GemmaSelf: %s", e)

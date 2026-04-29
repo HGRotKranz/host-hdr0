@@ -1,214 +1,162 @@
+#             █ █ ▀ █▄▀ ▄▀█ █▀█ ▀
+#             █▀█ █ █ █ █▀█ █▀▄ █
+#              © Copyright 2022
+#           https://t.me/hikariatama
+#
+# 🔒      Licensed under the GNU AGPLv3
+# 🌐 https://www.gnu.org/licenses/agpl-3.0.html
+
+# meta pic: https://static.dan.tatar/lovemagic_icon.png
+# meta banner: https://mods.hikariatama.ru/badges/lovemagic.jpg
+# meta developer: @rotkranz
+# scope: inline
+# scope: hikka_only
+# scope: hikka_min 1.3.0
+
+import json
+import logging
 import random
-from .. import utils, loader
 from asyncio import sleep
+from typing import Union
+
+import requests
+from telethon.tl.types import Message
+
+from .. import loader, utils
+from ..inline.types import InlineCall
+
+logger = logging.getLogger(__name__)
 
 
 @loader.tds
 class ILYMod(loader.Module):
-    """Famous TikTok hearts animation implemented in FTG"""
+    """Famous TikTok hearts animation implemented in Hikka w/o logspam"""
 
-    strings = {"name": "LoveMagic"}
+    strings = {
+        "name": "LoveMagic",
+        "message": "<b>❤️‍🔥 I want to tell you something...</b>\n<i>{}</i>",
+    }
 
-    async def ilycmd(self, message: "telethon.tl.types.Message") -> None:
-        """This famous TikTok animation..."""
-        if not message.out:
-            message = await message.respond("ily")
+    strings_ru = {
+        "message": "<b>❤️‍🔥 Я хочу тебе сказать кое-что...</b>\n<i>{}</i>",
+        "_cls_doc": "Известная TikTok анимация сердечек без спама в логи и флудвейтов",
+    }
 
-        arr = ["❤️", "🧡", "💛", "💚", "💙", "💜", "🤎", "🖤", "💖"]
-        h = "🤍"
-        first_block = ""
-        for i in "".join(
-            [
-                h * 9,
-                "\n",
-                h * 2,
-                arr[0] * 2,
-                h,
-                arr[0] * 2,
-                h * 2,
-                "\n",
-                h,
-                arr[0] * 7,
-                h,
-                "\n",
-                h,
-                arr[0] * 7,
-                h,
-                "\n",
-                h,
-                arr[0] * 7,
-                h,
-                "\n",
-                h * 2,
-                arr[0] * 5,
-                h * 2,
-                "\n",
-                h * 3,
-                arr[0] * 3,
-                h * 3,
-                "\n",
-                h * 4,
-                arr[0],
-                h * 4,
-            ]
-        ).split("\n"):
-            first_block += i + "\n"
-            await message.edit(first_block)
-            await sleep(0.1)
-        for i in arr:
-            await message.edit(
-                "".join(
-                    [
-                        h * 9,
-                        "\n",
-                        h * 2,
-                        i * 2,
-                        h,
-                        i * 2,
-                        h * 2,
-                        "\n",
-                        h,
-                        i * 7,
-                        h,
-                        "\n",
-                        h,
-                        i * 7,
-                        h,
-                        "\n",
-                        h,
-                        i * 7,
-                        h,
-                        "\n",
-                        h * 2,
-                        i * 5,
-                        h * 2,
-                        "\n",
-                        h * 3,
-                        i * 3,
-                        h * 3,
-                        "\n",
-                        h * 4,
-                        i,
-                        h * 4,
-                        "\n",
-                        h * 9,
-                    ]
-                )
+    async def client_ready(self):
+        self.classic_frames = (
+            await utils.run_sync(
+                requests.get,
+                "https://gist.github.com/hikariatama/89d0246c72e5882e12af43be63f5bca5/raw/08a5df7255d5e925ab2ede1efc892d9dc93af8e1/ily_classic.json",
             )
-            await sleep(0.2)
-        for _ in range(8):
-            rand = random.choices(arr, k=34)
-            await message.edit(
-                "".join(
-                    [
-                        h * 9,
-                        "\n",
-                        h * 2,
-                        rand[0],
-                        rand[1],
-                        h,
-                        rand[2],
-                        rand[3],
-                        h * 2,
-                        "\n",
-                        h,
-                        rand[4],
-                        rand[5],
-                        rand[6],
-                        rand[7],
-                        rand[8],
-                        rand[9],
-                        rand[10],
-                        h,
-                        "\n",
-                        h,
-                        rand[11],
-                        rand[12],
-                        rand[13],
-                        rand[14],
-                        rand[15],
-                        rand[16],
-                        rand[17],
-                        h,
-                        "\n",
-                        h,
-                        rand[18],
-                        rand[19],
-                        rand[20],
-                        rand[21],
-                        rand[22],
-                        rand[23],
-                        rand[24],
-                        h,
-                        "\n",
-                        h * 2,
-                        rand[25],
-                        rand[26],
-                        rand[27],
-                        rand[28],
-                        rand[29],
-                        h * 2,
-                        "\n",
-                        h * 3,
-                        rand[30],
-                        rand[31],
-                        rand[32],
-                        h * 3,
-                        "\n",
-                        h * 4,
-                        rand[33],
-                        h * 4,
-                        "\n",
-                        h * 9,
-                    ]
-                )
+        ).json()
+
+        self.gay_frames = (
+            await utils.run_sync(
+                requests.get,
+                "https://gist.github.com/hikariatama/3596a7c4f273a41e5289586ccff53a71/raw/f680c04f5855dcb02645b603d84d2496a8ea3350/ily_gay.json",
             )
-            await sleep(0.2)
-        fourth = "".join(
-            [
-                h * 9,
-                "\n",
-                h * 2,
-                arr[0] * 2,
-                h,
-                arr[0] * 2,
-                h * 2,
-                "\n",
-                h,
-                arr[0] * 7,
-                h,
-                "\n",
-                h,
-                arr[0] * 7,
-                h,
-                "\n",
-                h,
-                arr[0] * 7,
-                h,
-                "\n",
-                h * 2,
-                arr[0] * 5,
-                h * 2,
-                "\n",
-                h * 3,
-                arr[0] * 3,
-                h * 3,
-                "\n",
-                h * 4,
-                arr[0],
-                h * 4,
-                "\n",
-                h * 9,
-            ]
+        ).json()
+
+    async def ily_handler(
+        self,
+        obj: Union[InlineCall, Message],
+        text: str,
+        inline: bool = False,
+    ):
+        frames = self.classic_frames + [
+            f'<b>{" ".join(text.split()[: i + 1])}</b>'
+            for i in range(len(text.split()))
+        ]
+
+        obj = await self.animate(obj, frames, interval=0.5, inline=inline)
+
+        await sleep(10)
+        if not isinstance(obj, Message):
+            await obj.edit(
+                f"<b>{text}</b>",
+                reply_markup={
+                    "text": "💔 Хочу также!",
+                    "url": "https://t.me/hikka_talks",
+                },
+            )
+
+            await obj.unload()
+
+    async def ily_handler_gay(
+        self,
+        obj: Union[InlineCall, Message],
+        text: str,
+        inline: bool = False,
+    ):
+        obj = await self.animate(
+            obj,
+            self.gay_frames
+            + [
+                f'<b>{" ".join(text.split()[: i + 1])}</b>'
+                for i in range(len(text.split()))
+            ],
+            interval=0.5,
+            inline=inline,
         )
-        await message.edit(fourth)
-        for _ in range(47):
-            fourth = fourth.replace("🤍", "❤️", 1)
-            await message.edit(fourth)
-            await sleep(0.07)
-        for i in range(8):
-            await message.edit((arr[0] * (8 - i) + "\n") * (8 - i))
-            await sleep(0.3)
-        for i in ["I", "I ❤️", "I ❤️ U", "I ❤️ U!"]:
-            await message.edit(f"<b>{i}</b>")
-            await sleep(0.2)
+
+        await sleep(10)
+        if not isinstance(obj, Message):
+            await obj.edit(
+                f"<b>{text}</b>",
+                reply_markup={
+                    "text": "💔 Хочу также!",
+                    "url": "https://t.me/hikka_talks",
+                },
+            )
+
+            await obj.unload()
+
+    @loader.command(ru_doc="Отправить анимацию сердец в инлайне")
+    async def ilyicmd(self, message: Message):
+        """Send inline message with animated hearts"""
+        args = utils.get_args_raw(message)
+        await self.inline.form(
+            self.strings("message").format("*" * (len(args) or 9)),
+            reply_markup={
+                "text": "🧸 Open",
+                "callback": self.ily_handler,
+                "args": (args or "I ❤️ you!",),
+                "kwargs": {"inline": True},
+            },
+            message=message,
+            disable_security=True,
+        )
+
+    @loader.command(ru_doc="Отправить анимацию сердец")
+    async def ily(self, message: Message):
+        """Send message with animated hearts"""
+        await self.ily_handler(
+            message,
+            utils.get_args_raw(message) or "I ❤️ you!",
+            inline=False,
+        )
+
+    @loader.command(ru_doc="Отправить гейскую анимацию сердец в инлайне")
+    async def ilygayicmd(self, message: Message):
+        """Send inline message with animated hearts (gay)"""
+        args = utils.get_args_raw(message)
+        await self.inline.form(
+            self.strings("message").format("*" * (len(args) or 21)),
+            reply_markup={
+                "text": "🧸 Open",
+                "callback": self.ily_handler_gay,
+                "args": (args or "I am gay and I 💙 you!",),
+                "kwargs": {"inline": True},
+            },
+            message=message,
+            disable_security=True,
+        )
+
+    @loader.command(ru_doc="Отправить гейскую анимацию сердец")
+    async def ilygay(self, message: Message):
+        """Send message with animated hearts (gay)"""
+        await self.ily_handler_gay(
+            message,
+            utils.get_args_raw(message) or "I am gay and I 💙 you!",
+            inline=False,
+        )
