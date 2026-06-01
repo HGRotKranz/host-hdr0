@@ -1,5 +1,4 @@
-# meta developer: @Huai_Baike
-__version__ = (5, 1, 2)
+__version__ = (5, 2, 0)
 
 import os
 import re
@@ -51,6 +50,9 @@ VERTICAL_URL_PATTERNS = [
 
 _INVALID_FNAME_CHARS = r'[\\/:*?"<>|]'
 _MAX_FNAME_LEN = 180
+
+# Таймаут на одне завдання в черзі (10 хвилин)
+_TASK_TIMEOUT = 600
 
 
 def _sanitize_filename(name: str) -> str:
@@ -154,22 +156,22 @@ def _normalize_youtube_url(url: str) -> str:
 
 
 def _detect_js_runtime() -> tuple[str, str] | None:
-    """
-    Повертає (runtime_name, runtime_path) або None.
-    Перевіряє node/nodejs/deno у PATH та у типових директоріях.
-    """
     candidates = [
-        ("node",   ["/usr/bin/node",   "/usr/local/bin/node"]),
+        ("node",   [
+            "/usr/bin/node", "/usr/local/bin/node",
+            "/usr/local/nvm/versions/node/current/bin/node",
+            "/root/.nvm/versions/node/current/bin/node",
+        ]),
         ("nodejs", ["/usr/bin/nodejs", "/usr/local/bin/nodejs"]),
-        ("deno",   ["/usr/bin/deno",   "/usr/local/bin/deno",
-                    os.path.expanduser("~/.deno/bin/deno")]),
+        ("deno",   [
+            "/usr/bin/deno", "/usr/local/bin/deno",
+            os.path.expanduser("~/.deno/bin/deno"),
+        ]),
     ]
     for name, paths in candidates:
-        # Спочатку — конкретні шляхи
         for p in paths:
             if os.path.isfile(p) and os.access(p, os.X_OK):
                 return (name, p)
-        # Потім — shutil.which (PATH)
         found = shutil.which(name)
         if found:
             return (name, found)
@@ -177,15 +179,9 @@ def _detect_js_runtime() -> tuple[str, str] | None:
 
 
 def _js_runtime_arg() -> str | None:
-    """
-    Повертає рядок для yt-dlp extractor_args js_runtimes,
-    наприклад 'node:/usr/bin/node', або None якщо не знайдено.
-    """
     rt = _detect_js_runtime()
     if rt:
         name, path = rt
-        # yt-dlp приймає: node, nodejs, deno (назва без суфікса)
-        # Нормалізуємо nodejs → node
         runtime_key = "node" if name == "nodejs" else name
         return f"{runtime_key}:{path}"
     return None
@@ -197,47 +193,53 @@ class VideoDownloaderMod(loader.Module):
 
     strings = {
         "name": "VideoDownloader",
-        "loading":          "<b>📥 Завантажую...</b>",
-        "loading_progress": "<b>📥 Завантажую... {}%</b>",
-        "loading_retry":    "<b>🔄 Знижую якість, повторюю... ({}/{})</b>",
-        "loading_playlist": "<b>📋 Плейлист: {}/{}...</b>",
-        "loading_photo":    "<b>🖼 Завантажую медіа...</b>",
-        "loading_fix":      "<b>🔧 Виправляю орієнтацію відео...</b>",
+        "loading":            "<b>📥 Завантажую...</b>",
+        "loading_progress":   "<b>📥 Завантажую... {}%</b>",
+        "loading_retry":      "<b>🔄 Знижую якість, повторюю... ({}/{})</b>",
+        "loading_playlist":   "<b>📋 Плейлист: {}/{}...</b>",
+        "loading_photo":      "<b>🖼 Завантажую медіа...</b>",
+        "loading_fix":        "<b>🔧 Виправляю орієнтацію відео...</b>",
         "loading_transcript": "<b>📝 Витягую транскрипт...</b>",
-        "err_file":         "<b>❌ Не вдалося отримати файл.</b>",
-        "err_size":         "<b>❌ Файл завеликий ({} МБ). Знижую якість...</b>",
-        "err_size_final":   "<b>❌ Файл завеликий навіть у найнижчій якості.</b>",
-        "err_limit":        "<b>🚫 Денний ліміт ({} завантажень) вичерпано.</b>",
-        "err_cooldown":     "<b>⏳ Зачекай {} сек.</b>",
-        "err_playlist_off": "<b>❌ Плейлисти вимкнено: <code>.vdlset playlist 1</code></b>",
-        "err_queue_full":   "<b>⏳ Черга повна ({} завдань).</b>",
-        "err_no_transcript":"<b>❌ Транскрипт недоступний для цього відео.</b>",
-        "playlist_done":    "<b>✅ Плейлист: {ok}/{total} завантажено.</b>",
-        "queue_pos":        "<b>📋 Черга: позиція {pos}</b>",
-        "toggled_on":       "<b>✅ Downloader: ON</b>",
-        "toggled_off":      "<b>❌ Downloader: OFF</b>",
-        "audio_on":         "<b>🎵 Аудіо-режим: ON</b>",
-        "audio_off":        "<b>🎬 Відео-режим: ON</b>",
-        "whitelist_added":  "<b>✅ Групу <code>{}</code> додано.</b>",
-        "whitelist_removed":"<b>🗑 Групу <code>{}</code> видалено.</b>",
-        "whitelist_empty":  "<b>📋 Білий список порожній.</b>",
-        "whitelist_list":   "<b>📋 Групи:</b>\n{}",
-        "not_a_group":      "<b>❌ Тільки в групах.</b>",
-        "already_in":       "<b>⚠️ Вже є в списку.</b>",
-        "not_in":           "<b>⚠️ Немає в списку.</b>",
-        "bl_added":         "<b>🚫 <code>{}</code> заблоковано.</b>",
-        "bl_removed":       "<b>✅ <code>{}</code> розблоковано.</b>",
-        "bl_empty":         "<b>📋 Чорний список порожній.</b>",
-        "bl_list":          "<b>📋 Заблоковані:</b>\n{}",
-        "bl_need_reply":    "<b>❌ Відповідай на повідомлення.</b>",
-        "bl_not_in":        "<b>⚠️ Немає в чорному списку.</b>",
-        "bl_already_in":    "<b>⚠️ Вже в чорному списку.</b>",
+        "err_file":           "<b>❌ Не вдалося отримати файл.</b>",
+        "err_size":           "<b>❌ Файл завеликий ({} МБ). Знижую якість...</b>",
+        "err_size_final":     "<b>❌ Файл завеликий навіть у найнижчій якості.</b>",
+        "err_limit":          "<b>🚫 Денний ліміт ({} завантажень) вичерпано.</b>",
+        "err_cooldown":       "<b>⏳ Зачекай {} сек.</b>",
+        "err_playlist_off":   "<b>❌ Плейлисти вимкнено: <code>.vdlset playlist 1</code></b>",
+        "err_queue_full":     "<b>⏳ Черга повна ({} завдань).</b>",
+        "err_no_transcript":  "<b>❌ Транскрипт недоступний для цього відео.</b>",
+        "err_timeout":        "<b>❌ Завантаження перервано: перевищено ліміт часу.</b>",
+        "playlist_done":      "<b>✅ Плейлист: {ok}/{total} завантажено.</b>",
+        "queue_pos":          "<b>📋 Черга: позиція {pos}</b>",
+        "toggled_on":         "<b>✅ Downloader: ON</b>",
+        "toggled_off":        "<b>❌ Downloader: OFF</b>",
+        "audio_on":           "<b>🎵 Аудіо-режим: ON</b>",
+        "audio_off":          "<b>🎬 Відео-режим: ON</b>",
+        "whitelist_added":    "<b>✅ Групу <code>{}</code> додано.</b>",
+        "whitelist_removed":  "<b>🗑 Групу <code>{}</code> видалено.</b>",
+        "whitelist_empty":    "<b>📋 Білий список порожній.</b>",
+        "whitelist_list":     "<b>📋 Групи:</b>\n{}",
+        "not_a_group":        "<b>❌ Тільки в групах.</b>",
+        "already_in":         "<b>⚠️ Вже є в списку.</b>",
+        "not_in":             "<b>⚠️ Немає в списку.</b>",
+        "bl_added":           "<b>🚫 <code>{}</code> заблоковано.</b>",
+        "bl_removed":         "<b>✅ <code>{}</code> розблоковано.</b>",
+        "bl_empty":           "<b>📋 Чорний список порожній.</b>",
+        "bl_list":            "<b>📋 Заблоковані:</b>\n{}",
+        "bl_need_reply":      "<b>❌ Відповідай на повідомлення.</b>",
+        "bl_not_in":          "<b>⚠️ Немає в чорному списку.</b>",
+        "bl_already_in":      "<b>⚠️ Вже в чорному списку.</b>",
+        "dl_started":         "<b>📥 Завантажую: <code>{url}</code></b>",
+        "dl_no_url":          "<b>❌ Вкажи URL або відповідай на повідомлення з посиланням.</b>",
+        "cookies_refreshed":  "<b>✅ Cookies оновлено ({} байт).</b>",
+        "cookies_refresh_err":"<b>❌ Помилка оновлення cookies: {}</b>",
         "stats": (
             "<b>📊 Статистика:</b>\n"
             "├ Всього: <code>{total}</code>\n"
             "├ Успішних: <code>{ok}</code>\n"
             "├ Помилок: <code>{err}</code>\n"
             "├ Retry: <code>{retried}</code>\n"
+            "├ Таймаутів: <code>{timeouts}</code>\n"
             "├ MP3: <code>{audio}</code>\n"
             "├ Фото: <code>{photos}</code>\n"
             "├ Плейлистів: <code>{playlists}</code>\n"
@@ -253,16 +255,17 @@ class VideoDownloaderMod(loader.Module):
         ),
         "js_runtime_status":  "<b>🟢 JS Runtime: <code>{rt}</code></b>",
         "js_runtime_missing": "<b>🔴 JS Runtime: не знайдено (YouTube може не працювати!)</b>",
-        "caption_video":    "<b>✅ Завантажено через Юзербота.</b>",
-        "caption_audio":    "<b>🎵 MP3 через Юзербота.</b>",
-        "caption_photo":    "<b>🖼 Фото через Юзербота.</b>",
-        "caption_file":     "<b>📎 Файл через Юзербота.</b>",
-        "caption_playlist": "<b>📋 {title} ({idx}/{total})</b>",
-        "transcript_header": "<b>📝 Транскрипт: {title}</b>\n\n",
+        "caption_video":      "<b>✅ Завантажено через Юзербота.</b>",
+        "caption_audio":      "<b>🎵 MP3 через Юзербота.</b>",
+        "caption_photo":      "<b>🖼 Фото через Юзербота.</b>",
+        "caption_file":       "<b>📎 Файл через Юзербота.</b>",
+        "caption_playlist":   "<b>📋 {title} ({idx}/{total})</b>",
+        "transcript_header":  "<b>📝 Транскрипт: {title}</b>\n\n",
         "help_text": (
-            "<b>🎬 VideoDownloader v5.1.2</b>\n\n"
+            "<b>🎬 VideoDownloader v5.2.0</b>\n\n"
             "<b>Основні команди:</b>\n"
             "• <code>.vdl</code> — увімк/вимк авто-завантаження\n"
+            "• <code>.vdldl [URL]</code> — ручне завантаження\n"
             "• <code>.vdlaudio</code> — перемкнути MP3/відео\n"
             "• <code>.vdlq [360/480/720/1080/best]</code> — якість\n"
             "• <code>.vdlcookies</code> — статус cookies\n"
@@ -303,11 +306,12 @@ class VideoDownloaderMod(loader.Module):
             loader.ConfigValue("ig_username",      "",    "Instagram логін"),
             loader.ConfigValue("ig_password",      "",    "Instagram пароль"),
             loader.ConfigValue("transcript_lang",  "uk",  "Мова транскрипту"),
+            loader.ConfigValue("task_timeout",     600,   "Таймаут завдання (сек)"),
         )
         self._stats = {
             "total": 0, "ok": 0, "err": 0, "retried": 0,
             "audio": 0, "photos": 0, "playlists": 0, "today": 0,
-            "transcripts": 0,
+            "transcripts": 0, "timeouts": 0,
             "day": time.strftime("%Y-%m-%d"),
             "platforms": defaultdict(int),
         }
@@ -315,7 +319,6 @@ class VideoDownloaderMod(loader.Module):
         self._queue: asyncio.Queue | None = None
         self._worker_task = None
         self._client = None
-        # Кешуємо JS runtime при старті — щоб не шукати кожного разу
         self._js_runtime: str | None = _js_runtime_arg()
         if self._js_runtime:
             logger.info("VideoDownloader: JS runtime detected: %s", self._js_runtime)
@@ -332,13 +335,21 @@ class VideoDownloaderMod(loader.Module):
     async def on_unload(self):
         if self._worker_task:
             self._worker_task.cancel()
+            try:
+                await self._worker_task
+            except asyncio.CancelledError:
+                pass
 
     async def _queue_worker(self):
         while True:
             try:
                 coro = await self._queue.get()
                 try:
-                    await coro
+                    timeout = self.config.get("task_timeout", _TASK_TIMEOUT)
+                    await asyncio.wait_for(coro, timeout=timeout)
+                except asyncio.TimeoutError:
+                    self._stats["timeouts"] += 1
+                    logger.warning("Queue task timed out after %s sec", timeout)
                 except Exception:
                     logger.exception("Queue worker task error")
                 finally:
@@ -493,14 +504,27 @@ class VideoDownloaderMod(loader.Module):
         return order[idx:]
 
     def _build_yt_extractor_args(self, player_client: str) -> dict:
-        """
-        Будує extractor_args для yt-dlp з підтримкою JS runtime.
-        ВИПРАВЛЕННЯ: додає js_runtimes щоб уникнути WARNING про відсутній JS runtime.
-        """
         args: dict = {"youtube": {"player_client": [player_client]}}
         if self._js_runtime:
             args["youtube"]["js_runtimes"] = [self._js_runtime]
         return args
+
+    def _find_audio_output(self, base_path: str, audio_fmt: str) -> str | None:
+        """
+        FIX: Надійно знаходить аудіофайл після FFmpegExtractAudio postprocessor.
+        prepare_filename повертає оригінальний шлях (.webm/.m4a), а не .mp3
+        тому шукаємо за базою імені.
+        """
+        # Спробуємо очікуваний шлях
+        expected = re.sub(r"\.\w+$", f".{audio_fmt}", base_path)
+        if os.path.isfile(expected) and os.path.getsize(expected) > 0:
+            return expected
+        # Шукаємо за базою (без розширення)
+        base_no_ext = re.sub(r"\.\w+$", "", base_path)
+        found = _find_file(base_no_ext)
+        if found and os.path.splitext(found)[1].lower() in AUDIO_EXTS:
+            return found
+        return None
 
     # ── progress hook ─────────────────────────────────────────────────────────
 
@@ -639,6 +663,8 @@ class VideoDownloaderMod(loader.Module):
         if not shortcode:
             return None
 
+        out_dir = base_name + "_ig"
+
         def _fetch():
             try:
                 import instaloader
@@ -653,12 +679,12 @@ class VideoDownloaderMod(loader.Module):
                     save_metadata=False,
                     compress_json=False,
                     post_metadata_txt_pattern="",
-                    dirname_pattern=base_name + "_ig",
+                    dirname_pattern=out_dir,
                     filename_pattern="{owner_username}_{shortcode}_{mediaid}",
                     quiet=True,
                 )
-                user = self.config.get("ig_username", "")
-                pwd = self.config.get("ig_password", "")
+                user = self.config["ig_username"]
+                pwd  = self.config["ig_password"]
                 if user and pwd:
                     try:
                         il.login(user, pwd)
@@ -666,7 +692,6 @@ class VideoDownloaderMod(loader.Module):
                         logger.warning("Instagram login failed: %s", e)
 
                 post = instaloader.Post.from_shortcode(il.context, shortcode)
-                out_dir = base_name + "_ig"
                 os.makedirs(out_dir, exist_ok=True)
                 il.download_post(post, target=out_dir)
 
@@ -681,17 +706,12 @@ class VideoDownloaderMod(loader.Module):
                         os.rename(fpath, new_path)
                         results.append(new_path)
 
-                try:
-                    shutil.rmtree(out_dir, ignore_errors=True)
-                except Exception:
-                    pass
-
                 if not results:
                     return None
 
                 if audio:
                     import subprocess
-                    audio_fmt = self.config.get("audio_format", "mp3")
+                    audio_fmt = self.config["audio_format"]
                     audio_results = []
                     for f in results:
                         if _file_type(f) == "video":
@@ -703,7 +723,10 @@ class VideoDownloaderMod(loader.Module):
                                 capture_output=True, timeout=120
                             )
                             if r.returncode == 0 and os.path.isfile(out_audio):
-                                os.remove(f)
+                                try:
+                                    os.remove(f)
+                                except Exception:
+                                    pass
                                 audio_results.append(out_audio)
                             else:
                                 audio_results.append(f)
@@ -715,6 +738,9 @@ class VideoDownloaderMod(loader.Module):
             except Exception as e:
                 logger.warning("instaloader failed for %s: %s", shortcode, e)
                 return None
+            finally:
+                # FIX: завжди чистимо тимчасову директорію
+                shutil.rmtree(out_dir, ignore_errors=True)
 
         return await utils.run_sync(_fetch)
 
@@ -734,16 +760,16 @@ class VideoDownloaderMod(loader.Module):
                 ]
             )
             postprocessors = self._audio_postprocessor() if audio else []
+            audio_fmt = self.config["audio_format"]
+
             for fmt in fmt_chain:
-                # ВИПРАВЛЕННЯ: noplaylist=False щоб завантажити всі слайди карусельного посту.
-                # outtmpl з %(autonumber)s гарантує унікальні імена для кожного файлу.
                 opts = {
                     "format": fmt,
                     "merge_output_format": "mp4" if not audio else None,
                     "outtmpl": f"{base_name}_ytdlp_%(autonumber)s.%(ext)s",
                     "quiet": True, "no_warnings": True,
-                    "noplaylist": False,      # дозволяємо карусель
-                    "ignoreerrors": True,     # пропускати невдалі слайди, а не падати
+                    "noplaylist": False,
+                    "ignoreerrors": True,
                     "postprocessors": postprocessors,
                 }
                 if cookies:
@@ -752,7 +778,6 @@ class VideoDownloaderMod(loader.Module):
                     with yt_dlp.YoutubeDL(opts) as ydl:
                         ydl.download([url])
 
-                    # Збираємо всі завантажені файли за шаблоном
                     found_files = sorted([
                         p for p in glob.glob(f"{base_name}_ytdlp_*")
                         if os.path.isfile(p) and os.path.getsize(p) > 0
@@ -878,7 +903,7 @@ class VideoDownloaderMod(loader.Module):
                     v_url = data.get(key) or data.get("play")
                     if not v_url:
                         return None
-                    ext = self.config.get("audio_format", "mp3") if audio else "mp4"
+                    ext = self.config["audio_format"] if audio else "mp4"
                     content = requests.get(v_url, timeout=30).content
                     p = f"{base_name}.{ext}"
                     with open(p, "wb") as f:
@@ -957,9 +982,7 @@ class VideoDownloaderMod(loader.Module):
     ) -> str | None:
         import yt_dlp
 
-        audio_fmt = self.config.get("audio_format", "mp3")
-
-        # ВИПРАВЛЕННЯ: передаємо js_runtimes через extractor_args
+        audio_fmt = self.config["audio_format"]
         extractor_args = self._build_yt_extractor_args(player_client)
 
         opts = {
@@ -991,10 +1014,12 @@ class VideoDownloaderMod(loader.Module):
                     return "TOO_LARGE"
 
                 requested = ydl.prepare_filename(info)
+
+                # FIX: надійний пошук аудіо після постпроцесингу
                 if audio:
-                    audio_out = re.sub(r"\.\w+$", f".{audio_fmt}", requested)
-                    if os.path.isfile(audio_out) and os.path.getsize(audio_out) > 0:
-                        return audio_out
+                    found = self._find_audio_output(requested, audio_fmt)
+                    if found:
+                        return found
                     found = _find_file(re.sub(r"\.\w+$", "", requested))
                     if found:
                         return found
@@ -1026,7 +1051,6 @@ class VideoDownloaderMod(loader.Module):
             else self._youtube_format_chain(quality, vertical)
         )
 
-        # Каскад клієнтів — від найстабільнішого до fallback
         for client in ("tv,tv_simply", "web_safari", "mweb"):
             for fmt in fmt_chain[:4]:
                 result = await utils.run_sync(
@@ -1040,7 +1064,7 @@ class VideoDownloaderMod(loader.Module):
                     logger.info("YT OK: client=%s fmt='%s'", client, fmt)
                     return result
 
-        # Останній шанс — без extractor_args (стандартний yt-dlp)
+        # Останній шанс — стандартний yt-dlp без extractor_args
         for fmt in fmt_chain:
             result = await utils.run_sync(
                 self._try_ydl_format,
@@ -1062,7 +1086,7 @@ class VideoDownloaderMod(loader.Module):
     ) -> str | None:
         import yt_dlp
 
-        audio_fmt = self.config.get("audio_format", "mp3")
+        audio_fmt = self.config["audio_format"]
 
         opts = {
             "format": fmt,
@@ -1076,7 +1100,6 @@ class VideoDownloaderMod(loader.Module):
         if cookies:
             opts["cookiefile"] = cookies
 
-        # ВИПРАВЛЕННЯ: додаємо js_runtimes і для загального yt-dlp (YouTube fallback)
         u_lower = url.lower()
         if ("youtube.com" in u_lower or "youtu.be" in u_lower) and self._js_runtime:
             opts["extractor_args"] = {
@@ -1095,10 +1118,12 @@ class VideoDownloaderMod(loader.Module):
                     return "TOO_LARGE"
 
                 requested = ydl.prepare_filename(info)
+
+                # FIX: надійний пошук аудіо після постпроцесингу
                 if audio:
-                    audio_out = re.sub(r"\.\w+$", f".{audio_fmt}", requested)
-                    if os.path.isfile(audio_out) and os.path.getsize(audio_out) > 0:
-                        return audio_out
+                    found = self._find_audio_output(requested, audio_fmt)
+                    if found:
+                        return found
                     found = _find_file(re.sub(r"\.\w+$", "", requested))
                     if found:
                         return found
@@ -1142,36 +1167,27 @@ class VideoDownloaderMod(loader.Module):
     async def _download(
         self, url: str, base_name: str, status_msg, audio: bool
     ) -> list | str | None:
-        """
-        Повертає list[str] (файли), "TOO_LARGE" або None.
-        Список може містити 1 або більше файлів (альбом).
-        """
         u = url.lower()
 
-        # TikTok
         if "tiktok.com" in u:
             return await self._dl_tiktok(url, base_name, audio)
 
-        # Pinterest
         if ("pinterest.com" in u or "pin.it" in u) and not audio:
             result = await self._dl_pinterest(url, base_name)
             if result:
                 return result
 
-        # Instagram
         if "instagram.com" in u or "instagr.am" in u:
             result = await self._dl_instagram_instaloader(url, base_name, audio)
             if result:
                 return result
             return await self._dl_instagram_ytdlp(url, base_name, audio)
 
-        # Twitter/X — спочатку фото, якщо є відео — падаємо у yt-dlp нижче
         if ("x.com" in u or "twitter.com" in u) and not audio:
             photo_result = await self._dl_twitter_photos(url, base_name)
             if photo_result:
                 return photo_result
 
-        # YouTube — окремий каскад із retry по якості
         if "youtube.com" in u or "youtu.be" in u:
             steps = self._quality_steps() if not audio else ["best"]
             max_retries = self.config["retries"]
@@ -1200,7 +1216,6 @@ class VideoDownloaderMod(loader.Module):
 
             return None
 
-        # Всі інші платформи
         vertical = _is_vertical_url(url)
         steps = self._quality_steps() if not audio else ["best"]
         max_retries = self.config["retries"]
@@ -1248,7 +1263,6 @@ class VideoDownloaderMod(loader.Module):
             if cookies:
                 opts["cookiefile"] = cookies
 
-            # ВИПРАВЛЕННЯ: js_runtimes для транскриптів YouTube
             if ("youtube.com" in url or "youtu.be" in url) and self._js_runtime:
                 opts["extractor_args"] = {
                     "youtube": {"js_runtimes": [self._js_runtime]}
@@ -1311,13 +1325,9 @@ class VideoDownloaderMod(loader.Module):
 
     async def _send_album(self, message, paths: list[str], caption: str):
         """
-        Відправляє файли як grouped media (альбом) в Telegram.
-        
-        ВИПРАВЛЕННЯ:
-        - caption передається як список рівної довжини (перший елемент — текст, решта — "")
-          бо Telethon grouped media вимагає або None або list[str] тієї ж довжини
-        - Файли групуються по типу (фото окремо від відео) бо Telegram не дозволяє мікс
-        - MAX_ALBUM=10 — ліміт Telegram на grouped media
+        Надсилає файли як grouped media (альбом) в Telegram.
+        Групує фото окремо від відео (Telegram не підтримує мікс).
+        MAX_ALBUM=10 — ліміт Telegram.
         """
         valid = [p for p in paths
                  if isinstance(p, str) and os.path.isfile(p) and os.path.getsize(p) > 0]
@@ -1329,9 +1339,7 @@ class VideoDownloaderMod(loader.Module):
             await self._send(message, valid[0], caption, force_document=(ftype == "other"))
             return
 
-        # Telegram grouped media не підтримує мікс фото+відео в одному альбомі.
-        # Розбиваємо на групи за типом: images та videos/audio/other
-        images = [p for p in valid if _file_type(p) == "image"]
+        images    = [p for p in valid if _file_type(p) == "image"]
         non_images = [p for p in valid if _file_type(p) != "image"]
 
         groups: list[list[str]] = []
@@ -1346,12 +1354,11 @@ class VideoDownloaderMod(loader.Module):
         for group in groups:
             for chunk_start in range(0, len(group), MAX_ALBUM):
                 chunk = group[chunk_start: chunk_start + MAX_ALBUM]
-                # Caption тільки для першого chunk першої групи
-                chunk_caption = caption if first_group and chunk_start == 0 else ""
+                # FIX: caption для першого файлу першої групи, решта — порожній рядок
+                chunk_caption = caption if (first_group and chunk_start == 0) else ""
                 first_group = False
 
                 if len(chunk) == 1:
-                    # Один файл — звичайне надсилання
                     ftype = _file_type(chunk[0])
                     try:
                         await message.client.send_file(
@@ -1365,8 +1372,7 @@ class VideoDownloaderMod(loader.Module):
                         logger.warning("Single file send failed: %s", e)
                     continue
 
-                # Grouped media: caption — список рівної довжини chunk
-                # Перший елемент — текст, решта порожні рядки
+                # FIX: captions_list завжди рівної довжини з chunk
                 captions_list = [chunk_caption] + [""] * (len(chunk) - 1)
                 try:
                     await message.client.send_file(
@@ -1380,11 +1386,13 @@ class VideoDownloaderMod(loader.Module):
                     logger.warning("Album send failed, trying individually: %s", e)
                     for i, p in enumerate(chunk):
                         ftype = _file_type(p)
+                        # FIX: перший файл fallback отримує caption, решта — порожній рядок
+                        fb_caption = captions_list[i] if i < len(captions_list) else ""
                         try:
                             await message.client.send_file(
                                 message.chat_id, p,
                                 reply_to=message.id,
-                                caption=captions_list[i],
+                                caption=fb_caption,
                                 parse_mode="html",
                                 force_document=(ftype == "other"),
                             )
@@ -1418,7 +1426,6 @@ class VideoDownloaderMod(loader.Module):
             }
             if cookies:
                 opts["cookiefile"] = cookies
-            # ВИПРАВЛЕННЯ: js_runtimes для плейлистів YouTube
             if self._js_runtime:
                 opts["extractor_args"] = {
                     "youtube": {"js_runtimes": [self._js_runtime]}
@@ -1522,7 +1529,6 @@ class VideoDownloaderMod(loader.Module):
         try:
             result = await self._download(url, base, status_msg, audio)
 
-            # Fallback — пряме завантаження
             if result is None:
                 await status_msg.edit(self.strings("loading_photo"))
                 direct = await self._try_direct(url, base)
@@ -1542,7 +1548,6 @@ class VideoDownloaderMod(loader.Module):
                     await status_msg.edit(self.strings("err_file"))
                     return
 
-                # Виправлення орієнтації тільки для одиночного відео
                 if len(valid) == 1 and _file_type(valid[0]) == "video":
                     valid[0] = await self._maybe_fix_orientation(valid[0], status_msg)
 
@@ -1558,8 +1563,6 @@ class VideoDownloaderMod(loader.Module):
                 else:
                     cap = self.strings("caption_video")
 
-                # ВИПРАВЛЕННЯ: спочатку надсилаємо альбом, потім видаляємо статус.
-                # Так статус-повідомлення видно поки файли завантажуються в Telegram.
                 await self._send_album(message, valid, cap)
                 send_ok = True
 
@@ -1572,6 +1575,13 @@ class VideoDownloaderMod(loader.Module):
                 self._stats["err"] += 1
                 await status_msg.edit(self.strings("err_file"))
 
+        except asyncio.TimeoutError:
+            self._stats["err"] += 1
+            self._stats["timeouts"] += 1
+            try:
+                await status_msg.edit(self.strings("err_timeout"))
+            except Exception:
+                pass
         except Exception:
             self._stats["err"] += 1
             logger.exception("Process error for url=%s", url)
@@ -1580,7 +1590,6 @@ class VideoDownloaderMod(loader.Module):
             except Exception:
                 pass
         finally:
-            # Видаляємо статус після надсилання (або при помилці через 3 сек)
             if send_ok:
                 try:
                     await status_msg.delete()
@@ -1686,6 +1695,38 @@ class VideoDownloaderMod(loader.Module):
         )
 
     @loader.command()
+    async def vdldl(self, message):
+        """Ручне завантаження: .vdldl [URL або reply з посиланням]"""
+        args = utils.get_args_raw(message).strip()
+        url = self._extract_url(args) if args else None
+
+        if not url:
+            reply = await message.get_reply_message()
+            if reply and reply.raw_text:
+                url = self._extract_url(reply.raw_text)
+
+        if not url:
+            return await utils.answer(message, self.strings("dl_no_url"))
+
+        url = self._normalize(url)
+
+        if self._queue is None:
+            return
+
+        qsize = self._queue.qsize()
+        if qsize >= self.config["queue_max"]:
+            return await utils.answer(
+                message,
+                self.strings("err_queue_full").format(self.config["queue_max"])
+            )
+
+        status = await utils.answer(
+            message,
+            self.strings("dl_started").format(url=url)
+        )
+        await self._queue.put(self._process(url, message, status))
+
+    @loader.command()
     async def vdlaudio(self, message):
         """Перемкнути аудіо-режим"""
         self.config["audio_mode"] = not self.config["audio_mode"]
@@ -1717,7 +1758,8 @@ class VideoDownloaderMod(loader.Module):
                 "<b>Параметри:</b>\ncooldown, limit, size, auto_delete,\n"
                 "retries, queue_max, notify_dm,\n"
                 "fix_orientation, playlist, playlist_max,\n"
-                "audio_format (mp3/m4a/wav/opus/flac)"
+                "audio_format (mp3/m4a/wav/opus/flac),\n"
+                "timeout (сек, таймаут завдання)"
             )
         key, raw = args[0].lower(), args[1]
         mapping = {
@@ -1731,6 +1773,7 @@ class VideoDownloaderMod(loader.Module):
             "fix_orientation": ("fix_orientation",   bool, ""),
             "playlist":        ("playlist_enabled",  bool, ""),
             "playlist_max":    ("playlist_max",      int,  "відео"),
+            "timeout":         ("task_timeout",      int,  "сек"),
         }
         if key == "audio_format":
             valid = {"mp3", "m4a", "wav", "opus", "flac", "aac"}
@@ -1928,7 +1971,9 @@ class VideoDownloaderMod(loader.Module):
             message,
             self.strings("stats").format(
                 total=s["total"], ok=s["ok"], err=s["err"],
-                retried=s["retried"], audio=s["audio"],
+                retried=s["retried"],
+                timeouts=s.get("timeouts", 0),
+                audio=s["audio"],
                 photos=s["photos"], playlists=s["playlists"],
                 transcripts=s.get("transcripts", 0),
                 today=s["today"],
@@ -1943,7 +1988,7 @@ class VideoDownloaderMod(loader.Module):
         self._stats = {
             "total": 0, "ok": 0, "err": 0, "retried": 0,
             "audio": 0, "photos": 0, "playlists": 0, "today": 0,
-            "transcripts": 0,
+            "transcripts": 0, "timeouts": 0,
             "day": time.strftime("%Y-%m-%d"),
             "platforms": defaultdict(int),
         }
