@@ -164,3 +164,4 @@ yandere
 yandexrs
 youdbettersleep
 zombie_users
+mistralAI
