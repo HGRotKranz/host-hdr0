@@ -1,7 +1,7 @@
 # meta developer: @RotKranz (enhanced)
 # meta syntax: .mistral | .mistralimg | .mistralagent | .mistralagentadd
 
-__version__ = (4, 0, 0)
+__version__ = (4, 1, 0)
 
 import asyncio
 import base64
@@ -25,7 +25,6 @@ logger = logging.getLogger(__name__)
 # ── Авто-встановлення залежностей ────────────────────────────────────────────
 
 def _ensure_pkg(pkg: str, import_name: str | None = None) -> bool:
-    """Встановлює пакет якщо його немає. Повертає True якщо успішно."""
     name = import_name or pkg
     try:
         importlib.import_module(name)
@@ -45,7 +44,6 @@ def _ensure_pkg(pkg: str, import_name: str | None = None) -> bool:
             logger.warning("MistralAI: не вдалося встановити %s: %s", pkg, e)
             return False
 
-# Ініціалізація залежностей при імпорті модуля
 _ensure_pkg("langdetect")
 _ensure_pkg("numpy")
 
@@ -63,7 +61,8 @@ except ImportError:
 
 # ── Константи ─────────────────────────────────────────────────────────────────
 
-BASE_URL = "https://api.mistral.ai"
+BASE_URL       = "https://api.mistral.ai"
+WW_DOMAIN      = "https://werwolf.pp.ua"
 ROLE_USER      = "user"
 ROLE_ASSISTANT = "assistant"
 
@@ -72,15 +71,48 @@ TOOL_CODE_INTERP = {"type": "code_interpreter"}
 TOOL_IMAGE_GEN   = {"type": "image_generation"}
 TOOL_WEB_PREMIUM = {"type": "web_search_premium"}
 
-# Ключові слова для виявлення звернення в групах
 _TRIGGER_WORDS = {
     "uk": ["боте", "бот", "асистенте", "ai", "аі", "гей", "гей бот"],
     "ru": ["бот", "ассистент", "эй бот", "ai", "аи"],
     "en": ["bot", "assistant", "hey bot", "ai"],
 }
 
-# Максимальна кількість повідомлень для контексту при стрімінгу
-_STREAM_UPDATE_INTERVAL = 0.8  # секунди між оновленнями при стрімінгу
+_STREAM_UPDATE_INTERVAL = 0.8
+
+# ── Werwolf: які дії підтримуються ───────────────────────────────────────────
+# Агент може вставити у відповідь тег [WERWOLF:дія:параметр]
+# Модуль перехопить його, виконає запит і підставить результат
+
+WW_ACTIONS = {
+    "profile":       "api/profile",                          # без параметра
+    "user":          "api/public/users/{param}",             # param = tg_id
+    "group":         "api/public/groups/{param}",            # param = chat_id
+    "pets":          "api/pets",                             # без параметра
+    "friends":       "api/friends",                          # без параметра
+    "relationships": "api/public/relationships/chat/{param}",# param = chat_id
+}
+
+# Системний блок, який додається до промпту агента в режимі авто
+_WW_SYSTEM_BLOCK = """
+=== WERWOLF ІНТЕГРАЦІЯ ===
+У тебе є доступ до ігрового сервісу Werwolf. Коли користувач питає про:
+- свою статистику, монети, золото, баланс, рівень → вставляй [WERWOLF:profile:]
+- статистику конкретного користувача (є його tg_id) → [WERWOLF:user:{tg_id}]
+- статистику групи → [WERWOLF:group:{chat_id}]
+- своїх петів → [WERWOLF:pets:]
+- своїх друзів → [WERWOLF:friends:]
+- зв'язки у чаті → [WERWOLF:relationships:{chat_id}]
+
+ВАЖЛИВО:
+- Вставляй тег ТІЛЬКИ коли питання явно стосується Werwolf/гри/статистики
+- Тег буде замінено реальними даними автоматично — просто встав його у потрібному місці відповіді
+- Якщо не впевнений що питання про Werwolf — НЕ вставляй тег, відповідай звичайно
+- Один тег на запит
+=== КІНЕЦЬ БЛОКУ ===
+"""
+
+# Regex для пошуку тегу у відповіді агента
+_WW_TAG_RE = re.compile(r"\[WERWOLF:(\w+):([^\]]*)\]")
 
 
 # ── Markdown → HTML ───────────────────────────────────────────────────────────
@@ -101,7 +133,6 @@ def _md_to_html(text: str) -> str:
 
 
 def _detect_lang(text: str) -> str:
-    """Визначає мову тексту. Повертає код мови ('uk', 'ru', 'en', тощо)."""
     if not _HAS_LANGDETECT or not text.strip():
         return "uk"
     try:
@@ -111,7 +142,6 @@ def _detect_lang(text: str) -> str:
 
 
 def _is_addressed_to_bot(text: str, bot_name: str = "") -> bool:
-    """Перевіряє чи звертаються до бота в груповому чаті."""
     tl = text.lower()
     if bot_name and bot_name.lower() in tl:
         return True
@@ -123,7 +153,6 @@ def _is_addressed_to_bot(text: str, bot_name: str = "") -> bool:
 
 
 def _cosine_similarity(a: list, b: list) -> float:
-    """Косинусна схожість між двома векторами."""
     if not _HAS_NUMPY:
         dot = sum(x * y for x, y in zip(a, b))
         na  = math.sqrt(sum(x * x for x in a))
@@ -156,10 +185,124 @@ def _parse_conversation_output(data: dict) -> tuple[str, list[bytes]]:
     return "\n".join(texts).strip(), images
 
 
+# ── Werwolf форматери (компактні) ─────────────────────────────────────────────
+
+def _ww_fmt_profile(data: dict) -> str:
+    """Компактний вивід профілю для вставки у відповідь агента."""
+    bal   = data.get("balance", {})
+    stats = data.get("stats", {})
+    lvl   = data.get("level", {})
+    prem  = data.get("premium", {})
+
+    coins = bal.get("coins", 0)
+    bank  = bal.get("bank", 0)
+    gold  = bal.get("gold", 0)
+    total = stats.get("total_messages", 0)
+    level = lvl.get("level", 0)
+    prem_active = prem.get("is_active", False)
+    prem_lvl    = lvl.get("level", 0) if prem_active else 0
+
+    lines = [
+        "📊 <b>Werwolf профіль</b>",
+        f"⭐ Монети: <b>{coins:.0f}</b>  🏦 Банк: <b>{bank:.1f}</b>  🥇 Золото: <b>{gold:.1f}</b>",
+        f"📈 Рівень: <b>{level}</b>  💬 Повідомлень: <b>{total:,}</b>",
+    ]
+    if prem_active:
+        lines.append(f"👑 Преміум {prem_lvl}")
+    return "\n".join(lines)
+
+
+def _ww_fmt_user(data: dict) -> str:
+    u     = data.get("user", {})
+    stats = data.get("stats", {})
+    bdown = stats.get("message_breakdown", {})
+
+    name     = u.get("display_name") or u.get("name") or "?"
+    total    = bdown.get("total") or stats.get("total_messages", 0)
+    stars    = u.get("stars", 0)
+    gold     = u.get("gold", 0)
+    wins     = u.get("wins", 0)
+    losses   = u.get("losses", 0)
+
+    lines = [
+        f"👤 <b>{name}</b>",
+        f"💬 Повідомлень: <b>{total:,}</b>",
+        f"⭐ {stars:.0f}  🥇 {gold:.1f}",
+    ]
+    if wins or losses:
+        tg = wins + losses
+        wr = round(wins / tg * 100) if tg else 0
+        lines.append(f"🏆 {wins}W/{losses}L  WR {wr}%")
+    return "\n".join(lines)
+
+
+def _ww_fmt_group(data: dict) -> str:
+    title   = data.get("title", "?")
+    members = data.get("members", 0)
+    stats   = data.get("stats", {})
+    total   = stats.get("total_messages", 0)
+    top     = stats.get("top_users", [])[:3]
+
+    lines = [
+        f"👥 <b>{title}</b>  ({members:,} учасників)",
+        f"💬 Всього повідомлень: <b>{total:,}</b>",
+    ]
+    if top:
+        top_names = [u.get("name") or u.get("display_name") or "?" for u in top]
+        lines.append(f"🏆 Топ: {', '.join(top_names)}")
+    return "\n".join(lines)
+
+
+def _ww_fmt_pets(data: dict) -> str:
+    pets = data.get("pets", [])
+    if not pets:
+        return "🐾 Петів немає."
+    lines = ["🐾 <b>Пети:</b>"]
+    for p in pets:
+        name  = p.get("name", "?")
+        stage = p.get("stage_label") or p.get("stage", "?")
+        lvl   = p.get("level", 0)
+        lines.append(f"· {name}  {stage}  lvl {lvl}")
+    return "\n".join(lines)
+
+
+def _ww_fmt_friends(data: dict) -> str:
+    friends = data.get("friends", [])
+    if not friends:
+        return "👥 Друзів немає."
+    names = [f.get("name") or f.get("username") or "?" for f in friends[:5]]
+    more  = f"  (+{len(friends)-5})" if len(friends) > 5 else ""
+    return f"👥 <b>Друзі:</b> {', '.join(names)}{more}"
+
+
+def _ww_fmt_relationships(data: dict) -> str:
+    entries = (data if isinstance(data, list)
+               else data.get("relationships") or data.get("items") or [])
+    if not entries:
+        return "🔗 Зв'язків немає."
+    lines = ["🔗 <b>Топ зв'язки:</b>"]
+    for e in entries[:5]:
+        n1    = e.get("user1_name") or e.get("name") or "?"
+        n2    = e.get("user2_name", "")
+        score = e.get("score") or e.get("messages") or 0
+        pair  = f"{n1} ↔ {n2}" if n2 else n1
+        lines.append(f"· {pair}  ({score})")
+    return "\n".join(lines)
+
+
+_WW_FORMATTERS = {
+    "profile":       _ww_fmt_profile,
+    "user":          _ww_fmt_user,
+    "group":         _ww_fmt_group,
+    "pets":          _ww_fmt_pets,
+    "friends":       _ww_fmt_friends,
+    "relationships": _ww_fmt_relationships,
+}
+
+
 # ── Структура для векторної пам'яті ──────────────────────────────────────────
 
 class MemoryEntry:
-    """Повідомлення з векторним ембедингом для семантичного пошуку."""
     __slots__ = ("role", "content", "embedding", "timestamp")
 
     def __init__(self, role: str, content: str, embedding: list | None = None):
@@ -196,8 +339,8 @@ class UsageStats:
 
 @loader.tds
 class MistralModule(loader.Module):
-    """Mistral AI v4: чат, зображення, OCR, TTS, транскрипція, агент-режим,
-    векторна пам'ять, стрімінг, авто-мова, статистика."""
+    """Mistral AI v4.1: чат, зображення, OCR, TTS, транскрипція, агент-режим,
+    векторна пам'ять, стрімінг, авто-мова, статистика, Werwolf інтеграція."""
 
     strings = {
         "name": "MistralAI",
@@ -260,13 +403,11 @@ class MistralModule(loader.Module):
             ),
             loader.ConfigValue(
                 "chat_model", "mistral-large-latest",
-                "Модель для .mistral (mistral-large-latest, codestral-latest, …)",
+                "Модель для .mistral",
             ),
             loader.ConfigValue(
                 "system_prompt",
-                "Ти — корисний асистент. Відповідай чітко і зрозуміло. "
-                "Якщо питання технічне — давай конкретні приклади коду. "
-                "Якщо питання розмовне — будь дружнім і лаконічним.",
+                "Ти — корисний асистент. Відповідай чітко і зрозуміло.",
                 "Системний промпт для .mistral",
             ),
             loader.ConfigValue("max_tokens", 2048, "Ліміт токенів"),
@@ -282,9 +423,9 @@ class MistralModule(loader.Module):
                 (
                     "Ти — особистий асистент власника цього Telegram-акаунту. "
                     "Спілкуйся природно, як жива людина. "
-                    "Відповідай мовою співрозмовника — якщо пишуть українською, "
-                    "відповідай українською; якщо англійською — англійською. "
-                    "Відповідай коротко і по суті. Не розкривай що ти AI якщо не питають напряму."
+                    "Відповідай мовою співрозмовника. "
+                    "Відповідай коротко і по суті. "
+                    "Не розкривай що ти AI якщо не питають напряму."
                 ),
                 "Промпт поведінки авто-агента",
             ),
@@ -298,7 +439,7 @@ class MistralModule(loader.Module):
             ),
             loader.ConfigValue(
                 "agent_history_limit", 50,
-                "Глибина пам'яті авто-агента (повідомлень на чат/юзера)",
+                "Глибина пам'яті авто-агента",
                 validator=loader.validators.Integer(minimum=5, maximum=500),
             ),
             loader.ConfigValue(
@@ -307,13 +448,8 @@ class MistralModule(loader.Module):
                 validator=loader.validators.Boolean(),
             ),
             loader.ConfigValue(
-                "agent_show_name_in_group", True,
-                "Підписувати ім'я у групових чатах",
-                validator=loader.validators.Boolean(),
-            ),
-            loader.ConfigValue(
                 "agent_group_mode", "addressed",
-                "Режим відповіді в групах: 'all' (на всі), 'addressed' (тільки якщо звертаються), 'reply' (тільки реплай)",
+                "Режим відповіді в групах: 'all' / 'addressed' / 'reply'",
                 validator=loader.validators.Choice(["all", "addressed", "reply"]),
             ),
             loader.ConfigValue(
@@ -323,23 +459,38 @@ class MistralModule(loader.Module):
             ),
             loader.ConfigValue(
                 "agent_stream", False,
-                "Стрімінг відповіді (поступове оновлення повідомлення) — лише для .mistral",
+                "Стрімінг відповіді",
                 validator=loader.validators.Boolean(),
             ),
             loader.ConfigValue(
                 "vector_memory", False,
-                "Векторна пам'ять (семантичний пошук по контексту, потребує numpy)",
+                "Векторна пам'ять (потребує numpy)",
                 validator=loader.validators.Boolean(),
             ),
             loader.ConfigValue(
                 "vector_top_k", 5,
-                "Скільки релевантних спогадів підтягувати при векторній пам'яті",
+                "Скільки релевантних спогадів підтягувати",
                 validator=loader.validators.Integer(minimum=1, maximum=20),
+            ),
+            # ── Werwolf ────────────────────────────────────────────────────
+            loader.ConfigValue(
+                "werwolf_api_key", "",
+                "API ключ Werwolf (отримати через /api у боті)",
+                validator=loader.validators.Hidden(loader.validators.String()),
+            ),
+            loader.ConfigValue(
+                "werwolf_enabled", True,
+                "Увімкнути Werwolf інтеграцію в авто-агенті",
+                validator=loader.validators.Boolean(),
+            ),
+            loader.ConfigValue(
+                "werwolf_domain", WW_DOMAIN,
+                "Домен Werwolf API",
             ),
             # ── Інші моделі ────────────────────────────────────────────────
             loader.ConfigValue("ocr_model",           "mistral-ocr-latest",  "Модель OCR"),
             loader.ConfigValue("tts_model",           "mistral-tts-latest",  "Модель TTS"),
-            loader.ConfigValue("tts_voice",           "fr:emma",             "Голос TTS (lang:name)"),
+            loader.ConfigValue("tts_voice",           "fr:emma",             "Голос TTS"),
             loader.ConfigValue("transcription_model", "voxtral-mini-2507",   "Модель транскрипції"),
             loader.ConfigValue("embed_model",         "mistral-embed",       "Модель ембединів"),
             loader.ConfigValue(
@@ -350,23 +501,14 @@ class MistralModule(loader.Module):
 
         self._session: aiohttp.ClientSession | None = None
         self._me = None
-
-        # авто-агент: {chat_id: True}
         self._auto_chats: Dict[int, bool] = {}
 
-        # пам'ять: звичайна або векторна
-        # звичайна: {chat_id: deque[dict]} або {chat_id: {user_id: deque}}
-        # векторна:  {chat_id: list[MemoryEntry]} або {chat_id: {user_id: list}}
+        # Групова пам'ять: {chat_id: deque[dict]}  — завжди спільна для чату
         self._memory: Dict[int, object] = {}
 
-        # поточний активний Mistral-агент
         self._active_agent_id:   Optional[str] = None
         self._active_agent_name: Optional[str] = None
-
-        # статистика
         self._stats = UsageStats()
-
-        # ім'я бота (для визначення звернень у групах)
         self._bot_name: str = ""
 
     # ── Lifecycle ──────────────────────────────────────────────────────────────
@@ -404,47 +546,32 @@ class MistralModule(loader.Module):
         self.db.set("MistralAI", "active_agent_id",   self._active_agent_id   or "")
         self.db.set("MistralAI", "active_agent_name", self._active_agent_name or "")
 
-    def _get_plain_mem(self, chat_id: int, user_id: Optional[int] = None) -> collections.deque:
-        """Звичайна (plain) пам'ять."""
+    def _get_plain_mem(self, chat_id: int) -> collections.deque:
+        """Пам'ять для чату — завжди спільна.
+        В групах ім'я відправника вшивається у content: '[Ім'я]: текст'."""
         lim = self.config["agent_history_limit"]
-        if user_id is not None:
-            if chat_id not in self._memory:
-                self._memory[chat_id] = {}
-            grp = self._memory[chat_id]
-            if not isinstance(grp, dict):
-                self._memory[chat_id] = {}
-                grp = self._memory[chat_id]
-            if user_id not in grp:
-                grp[user_id] = collections.deque(maxlen=lim)
-            return grp[user_id]
-        else:
-            if chat_id not in self._memory or isinstance(self._memory[chat_id], dict):
-                self._memory[chat_id] = collections.deque(maxlen=lim)
-            return self._memory[chat_id]
+        if chat_id not in self._memory or not isinstance(self._memory[chat_id], collections.deque):
+            self._memory[chat_id] = collections.deque(maxlen=lim)
+        return self._memory[chat_id]
 
-    def _get_vec_mem(self, chat_id: int, user_id: Optional[int] = None) -> list:
-        """Векторна пам'ять (список MemoryEntry)."""
-        key = (chat_id, user_id) if user_id else chat_id
-        attr = "_vec_mem"
-        if not hasattr(self, attr):
-            setattr(self, attr, {})
-        vm = getattr(self, attr)
-        if key not in vm:
-            vm[key] = []
-        return vm[key]
+    def _get_vec_mem(self, chat_id: int) -> list:
+        if not hasattr(self, "_vec_mem"):
+            self._vec_mem: Dict[int, list] = {}
+        if chat_id not in self._vec_mem:
+            self._vec_mem[chat_id] = []
+        return self._vec_mem[chat_id]
 
-    def _vec_mem_add(self, chat_id: int, user_id: Optional[int], role: str,
+    def _vec_mem_add(self, chat_id: int, role: str,
                      content: str, embedding: list | None = None):
-        mem = self._get_vec_mem(chat_id, user_id)
+        mem = self._get_vec_mem(chat_id)
         mem.append(MemoryEntry(role, content, embedding))
         lim = self.config["agent_history_limit"]
         if len(mem) > lim:
             del mem[0]
 
-    def _vec_mem_relevant(self, chat_id: int, user_id: Optional[int],
+    def _vec_mem_relevant(self, chat_id: int,
                            query_emb: list, top_k: int) -> list[MemoryEntry]:
-        """Повертає top_k найбільш релевантних спогадів."""
-        mem = self._get_vec_mem(chat_id, user_id)
+        mem = self._get_vec_mem(chat_id)
         scored = []
         for entry in mem:
             if entry.embedding:
@@ -452,6 +579,96 @@ class MistralModule(loader.Module):
                 scored.append((sim, entry))
         scored.sort(key=lambda x: x[0], reverse=True)
         return [e for _, e in scored[:top_k]]
+
+    # ── Werwolf HTTP ──────────────────────────────────────────────────────────
+
+    def _ww_ok(self) -> bool:
+        return bool(self.config["werwolf_api_key"].strip()) and self.config["werwolf_enabled"]
+
+    def _ww_headers(self) -> dict:
+        return {"X-API-Key": self.config["werwolf_api_key"].strip()}
+
+    def _ww_url(self, path: str) -> str:
+        domain = str(self.config["werwolf_domain"]).rstrip("/")
+        return f"{domain}/{path.lstrip('/')}"
+
+    async def _ww_get(self, path: str) -> dict:
+        url = self._ww_url(path)
+        timeout = aiohttp.ClientTimeout(total=15)
+        try:
+            async with self._session.get(url, headers=self._ww_headers(), timeout=timeout) as r:
+                body = await r.text()
+                if r.status >= 400:
+                    raise RuntimeError(f"Werwolf HTTP {r.status}")
+                return json.loads(body)
+        except asyncio.TimeoutError:
+            raise RuntimeError("Werwolf таймаут")
+        except RuntimeError:
+            raise
+        except Exception as e:
+            raise RuntimeError(f"Werwolf: {e}")
+
+    async def _ww_resolve_tag(self, action: str, param: str,
+                               chat_id: int, sender_id: int) -> str:
+        """Виконує Werwolf запит і повертає відформатований рядок."""
+        if not self._ww_ok():
+            return ""
+        try:
+            # Підставляємо реальні значення якщо param порожній
+            if action == "profile":
+                data = await self._ww_get("api/profile")
+                return _ww_fmt_profile(data)
+
+            elif action == "user":
+                uid = param.strip() or str(sender_id)
+                data = await self._ww_get(f"api/public/users/{uid}")
+                return _ww_fmt_user(data)
+
+            elif action == "group":
+                cid = param.strip() or str(chat_id)
+                data = await self._ww_get(f"api/public/groups/{cid}")
+                return _ww_fmt_group(data)
+
+            elif action == "pets":
+                data = await self._ww_get("api/pets")
+                return _ww_fmt_pets(data)
+
+            elif action == "friends":
+                data = await self._ww_get("api/friends")
+                return _ww_fmt_friends(data)
+
+            elif action == "relationships":
+                cid = param.strip() or str(chat_id)
+                data = await self._ww_get(f"api/public/relationships/chat/{cid}")
+                return _ww_fmt_relationships(data)
+
+            else:
+                return ""
+        except RuntimeError as e:
+            logger.warning("Werwolf tag error: %s", e)
+            return f"⚠️ Не вдалося отримати дані Werwolf: {e}"
+
+    async def _ww_process_reply(self, text: str,
+                                  chat_id: int, sender_id: int) -> str:
+        """Знаходить [WERWOLF:...] теги у відповіді і замінює їх даними."""
+        match = _WW_TAG_RE.search(text)
+        if not match:
+            return text
+
+        action = match.group(1)
+        param  = match.group(2)
+        ww_data = await self._ww_resolve_tag(action, param, chat_id, sender_id)
+
+        if ww_data:
+            # Замінюємо тег на дані
+            replacement = f"\n\n{ww_data}"
+            text = text[:match.start()] + text[match.end():]
+            text = text.rstrip() + replacement
+        else:
+            # Прибираємо тег без заміни
+            text = text[:match.start()] + text[match.end():]
+
+        return text.strip()
 
     # ── Low-level HTTP з retry ─────────────────────────────────────────────────
 
@@ -482,7 +699,6 @@ class MistralModule(loader.Module):
         raise last_err
 
     async def _post_stream(self, path: str, payload: dict) -> str:
-        """POST зі стрімінгом. Повертає повний текст."""
         url = f"{BASE_URL}{path}"
         payload = {**payload, "stream": True}
         chunks = []
@@ -549,23 +765,54 @@ class MistralModule(loader.Module):
         self,
         history: collections.deque,
         new_msg: str,
-        label: str | None = None,
+        sender_name: str | None = None,
+        is_group: bool = False,
+        group_title: str | None = None,
         extra_context: list | None = None,
+        system_override: str | None = None,
     ) -> str:
-        """Чат з пам'яттю для авто-агента. extra_context — релевантні спогади з векторної пам'яті."""
-        system = self.config["agent_system_prompt"]
+        """Чат з пам'яттю.
+
+        В групах повідомлення зберігаються у форматі '[Ім'я]: текст',
+        тому модель знає хто що написав.
+
+        Якщо Werwolf увімкнено — додаємо блок з інструкцією до системного промпту.
+        """
+        base_system = system_override or self.config["agent_system_prompt"]
+
+        # Додаємо контекст про групу
+        if is_group:
+            group_ctx = (
+                f"\nТи зараз у груповому чаті{f' «{group_title}»' if group_title else ''}. "
+                "З тобою спілкуються різні люди — їх імена вказані у квадратних дужках, "
+                "наприклад [Олексій]: привіт. "
+                "Завжди звертайся до людини по імені. "
+                "Пам'ятай всю розмову — хто що питав і що ти відповідав."
+            )
+            system = base_system + group_ctx
+        else:
+            system = base_system
+
+        # Додаємо Werwolf інструкцію якщо є ключ
+        if self._ww_ok():
+            system = system + _WW_SYSTEM_BLOCK
+
         messages = [{"role": "system", "content": system}]
 
-        # Якщо є релевантний контекст з векторної пам'яті — додаємо на початок
+        # Релевантний контекст з векторної пам'яті
         if extra_context:
             ctx_text = "Корисний контекст з попередніх розмов:\n" + "\n".join(
-                f"[{e.role}]: {e.content}" for e in extra_context
+                f"{e.content}" for e in extra_context
             )
             messages.append({"role": "system", "content": ctx_text})
 
+        # Вся поточна пам'ять чату (вже містить '[Ім'я]: текст' для груп)
         messages.extend(list(history))
-        content = f"[{label}]: {new_msg}" if label else new_msg
+
+        # Поточне повідомлення (ще не збережене в history на момент виклику)
+        content = f"[{sender_name}]: {new_msg}" if (is_group and sender_name) else new_msg
         messages.append({"role": ROLE_USER, "content": content})
+
         payload = {
             "model": self.config["agent_model"],
             "max_tokens": self.config["max_tokens"],
@@ -576,7 +823,6 @@ class MistralModule(loader.Module):
 
     async def _chat_with_reply(self, question: str, reply_text: str,
                                 model: str | None = None) -> tuple[str, str, float]:
-        """Чат з контекстом реплаю."""
         m   = model or self.config["chat_model"]
         sys = self.config["system_prompt"]
         payload = {
@@ -584,9 +830,9 @@ class MistralModule(loader.Module):
             "max_tokens": self.config["max_tokens"],
             "messages": [
                 {"role": "system", "content": sys},
-                {"role": ROLE_USER,  "content": f"Контекст повідомлення:\n{reply_text}"},
+                {"role": ROLE_USER,      "content": f"Контекст повідомлення:\n{reply_text}"},
                 {"role": ROLE_ASSISTANT, "content": "Зрозумів, маю цей контекст."},
-                {"role": ROLE_USER,  "content": question},
+                {"role": ROLE_USER,      "content": question},
             ],
         }
         t0   = time.monotonic()
@@ -594,11 +840,10 @@ class MistralModule(loader.Module):
         text = data["choices"][0]["message"]["content"]
         return text, m, time.monotonic() - t0
 
-    # ── API: Стрімінг з live-оновленням повідомлення ──────────────────────────
+    # ── API: Стрімінг ──────────────────────────────────────────────────────────
 
     async def _stream_to_message(self, msg, prompt: str, model: str | None = None,
                                   system: str | None = None):
-        """Відправляє запит зі стрімінгом та оновлює повідомлення по ходу."""
         m   = model  or self.config["chat_model"]
         sys = system if system is not None else self.config["system_prompt"]
         payload = {
@@ -636,10 +881,7 @@ class MistralModule(loader.Module):
                 if now - last_update >= _STREAM_UPDATE_INTERVAL and chunks:
                     partial = "".join(chunks)
                     try:
-                        await utils.answer(
-                            msg,
-                            f"<b>🤖</b> {_md_to_html(partial)}▌",
-                        )
+                        await utils.answer(msg, f"<b>🤖</b> {_md_to_html(partial)}▌")
                         last_update = now
                     except Exception:
                         pass
@@ -648,7 +890,7 @@ class MistralModule(loader.Module):
         elapsed = time.monotonic() - t0
         return full, m, elapsed
 
-    # ── API: Conversations (агенти + image_generation) ─────────────────────────
+    # ── API: Conversations ─────────────────────────────────────────────────────
 
     async def _conversation(
         self,
@@ -698,7 +940,7 @@ class MistralModule(loader.Module):
     async def _agent_delete(self, agent_id: str) -> dict:
         return await self._delete(f"/v1/agents/{agent_id}")
 
-    # ── API: OCR ──────────────────────────────────────────────────────────────
+    # ── API: OCR, TTS, Transcription, Embeddings, Moderation ──────────────────
 
     async def _ocr_b64(self, data: bytes, mime: str) -> str:
         b64 = base64.b64encode(data).decode()
@@ -710,15 +952,11 @@ class MistralModule(loader.Module):
         resp = await self._post("/v1/ocr", {"model": self.config["ocr_model"], "document": doc})
         return "\n\n---\n\n".join(p.get("markdown", "") for p in resp.get("pages", [])).strip()
 
-    # ── API: Embeddings ───────────────────────────────────────────────────────
-
     async def _embeddings(self, text: str) -> tuple[list, str]:
         data = await self._post("/v1/embeddings", {
             "model": self.config["embed_model"], "input": [text], "encoding_format": "float",
         })
         return data["data"][0]["embedding"], data.get("model", self.config["embed_model"])
-
-    # ── API: TTS ──────────────────────────────────────────────────────────────
 
     async def _tts(self, text: str) -> bytes:
         url = f"{BASE_URL}/v1/audio/speech"
@@ -739,8 +977,6 @@ class MistralModule(loader.Module):
         buf.write(b"data"); buf.write(len(raw).to_bytes(4, "little")); buf.write(raw)
         return buf.getvalue()
 
-    # ── API: Transcription ────────────────────────────────────────────────────
-
     async def _transcribe(self, audio: bytes, fname: str = "audio.ogg") -> str:
         url  = f"{BASE_URL}/v1/audio/transcriptions"
         form = aiohttp.FormData()
@@ -756,8 +992,6 @@ class MistralModule(loader.Module):
             raise RuntimeError(str(d["error"]))
         return d.get("text", "")
 
-    # ── API: Moderation / Models / Embeddings ─────────────────────────────────
-
     async def _moderate(self, text: str) -> dict:
         return await self._post("/v1/moderations",
                                 {"model": "mistral-moderation-latest", "input": text})
@@ -766,7 +1000,7 @@ class MistralModule(loader.Module):
         return (await self._get("/v1/models")).get("data", [])
 
     # ════════════════════════════════════════════════════════════════════════════
-    # WATCHER — авто-агент (розумний режим)
+    # WATCHER — авто-агент
     # ════════════════════════════════════════════════════════════════════════════
 
     async def watcher(self, message):
@@ -785,125 +1019,171 @@ class MistralModule(loader.Module):
         if not text:
             return
 
+        # ── Визначаємо тип чату ───────────────────────────────────────────
+        is_group    = False
+        group_title = None
         try:
-            chat    = await message.get_chat()
+            chat     = await message.get_chat()
             is_group = hasattr(chat, "title")
+            if is_group:
+                group_title = getattr(chat, "title", None)
         except Exception:
-            is_group = False
+            pass
 
-        # Розумна фільтрація в групах
+        # ── Фільтрація в групах ───────────────────────────────────────────
         if is_group:
             mode = self.config["agent_group_mode"]
             if mode == "reply":
-                # Відповідаємо тільки якщо реплай на наше повідомлення
                 if not message.is_reply:
                     return
                 rep = await message.get_reply_message()
                 if not rep or (self._me and rep.sender_id != self._me.id):
                     return
             elif mode == "addressed":
-                # Відповідаємо якщо реплай на нас АБО звертаються по імені/тригерам
                 is_reply_to_us = False
                 if message.is_reply:
-                    rep = await message.get_reply_message()
-                    if rep and self._me and rep.sender_id == self._me.id:
-                        is_reply_to_us = True
+                    try:
+                        rep = await message.get_reply_message()
+                        if rep and self._me and rep.sender_id == self._me.id:
+                            is_reply_to_us = True
+                    except Exception:
+                        pass
                 if not is_reply_to_us and not _is_addressed_to_bot(text, self._bot_name):
                     return
-            # mode == "all": відповідаємо на всі
+            # mode == "all": відповідаємо на все
 
+        # ── Ім'я відправника ──────────────────────────────────────────────
+        sender_id = message.sender_id
         try:
             sender      = await message.get_sender()
             sender_name = (
-                getattr(sender, "first_name", "")
-                or getattr(sender, "username", "")
-                or str(message.sender_id)
+                getattr(sender, "first_name", None)
+                or getattr(sender, "username", None)
+                or str(sender_id)
             )
         except Exception:
-            sender_name = str(message.sender_id)
+            sender_name = str(sender_id)
 
-        user_key = message.sender_id if is_group else None
+        # ── Спільна пам'ять чату ──────────────────────────────────────────
+        # Одна deque на весь чат (і для груп, і для особистих).
+        # В групах content зберігається як '[Ім'я]: текст'.
+        history = self._get_plain_mem(chat_id)
 
-        # Визначення мови та адаптація промпту
+        # ── Векторна пам'ять ──────────────────────────────────────────────
         extra_context: list | None = None
         query_emb:     list | None = None
-
         if self.config["vector_memory"] and _HAS_NUMPY:
-            # Векторна пам'ять: отримуємо ембединг запиту та знаходимо релевантний контекст
             try:
                 query_emb, _ = await self._embeddings(text)
-                top_k        = self.config["vector_top_k"]
-                extra_context = self._vec_mem_relevant(chat_id, user_key, query_emb, top_k)
+                extra_context = self._vec_mem_relevant(
+                    chat_id, query_emb, self.config["vector_top_k"]
+                )
             except Exception:
                 pass
-            history = self._get_plain_mem(chat_id, user_key)
-        else:
-            history = self._get_plain_mem(chat_id, user_key)
 
-        label = sender_name if (is_group and self.config["agent_show_name_in_group"]) else None
-
-        # Мовна адаптація системного промпту
+        # ── Мовна адаптація ───────────────────────────────────────────────
         system_override = None
         if self.config["agent_auto_lang"] and _HAS_LANGDETECT:
             lang = _detect_lang(text)
             if lang and lang not in ("uk", "ru"):
-                # Для не-слов'янських мов — додаємо вказівку відповідати цією мовою
-                system_override = self.config["agent_system_prompt"] + f"\nВідповідай мовою: {lang}."
+                system_override = (
+                    self.config["agent_system_prompt"]
+                    + f"\nВідповідай мовою: {lang}."
+                )
 
-        # Зберігаємо вхідне повідомлення
-        history.append({"role": ROLE_USER, "content": text})
+        # ── Зберігаємо вхідне повідомлення у пам'ять ─────────────────────
+        # В групах — з іменем, щоб модель знала хто говорив
+        stored_content = f"[{sender_name}]: {text}" if is_group else text
+        history.append({"role": ROLE_USER, "content": stored_content})
 
-        agent_id = (
-            self._active_agent_id
-            or (self.config["agent_mistral_id"].strip() or None)
-        )
+        agent_id = self._active_agent_id or (self.config["agent_mistral_id"].strip() or None)
 
+        # ── Виклик моделі ─────────────────────────────────────────────────
         try:
             if self.config["agent_typing"]:
                 async with message.client.action(chat_id, "typing"):
                     reply_text, images = await self._watcher_call(
-                        agent_id, history, text, label, extra_context, system_override
+                        agent_id=agent_id,
+                        history=history,
+                        text=text,
+                        sender_name=sender_name,
+                        is_group=is_group,
+                        group_title=group_title,
+                        extra_context=extra_context,
+                        system_override=system_override,
                     )
             else:
                 reply_text, images = await self._watcher_call(
-                    agent_id, history, text, label, extra_context, system_override
+                    agent_id=agent_id,
+                    history=history,
+                    text=text,
+                    sender_name=sender_name,
+                    is_group=is_group,
+                    group_title=group_title,
+                    extra_context=extra_context,
+                    system_override=system_override,
                 )
         except RuntimeError as e:
             self._stats.inc(ok=False)
             logger.error("MistralAI watcher error: %s", e)
             return
 
+        # ── Обробляємо Werwolf теги у відповіді ──────────────────────────
+        if self._ww_ok():
+            try:
+                reply_text = await self._ww_process_reply(reply_text, chat_id, sender_id)
+            except Exception as e:
+                logger.warning("Werwolf process error: %s", e)
+
         self._stats.inc()
+
+        # ── Зберігаємо відповідь у пам'ять ───────────────────────────────
         history.append({"role": ROLE_ASSISTANT, "content": reply_text})
 
-        # Векторна пам'ять — зберігаємо з ембедингом
+        # Векторна пам'ять
         if self.config["vector_memory"] and _HAS_NUMPY:
-            self._vec_mem_add(chat_id, user_key, ROLE_USER, text, query_emb)
+            self._vec_mem_add(chat_id, ROLE_USER, stored_content, query_emb)
             try:
                 rep_emb, _ = await self._embeddings(reply_text)
             except Exception:
                 rep_emb = None
-            self._vec_mem_add(chat_id, user_key, ROLE_ASSISTANT, reply_text, rep_emb)
+            self._vec_mem_add(chat_id, ROLE_ASSISTANT, reply_text, rep_emb)
 
+        # ── Надсилаємо відповідь РЕПЛЕЄМ на повідомлення ─────────────────
+        # reply_to=message.id гарантує що бот завжди відповідає на конкретне повідомлення
         for img in images:
             if img.startswith(b"http"):
-                await message.client.send_file(chat_id, img.decode(), reply_to=message.id)
+                await message.client.send_file(
+                    chat_id, img.decode(),
+                    reply_to=message.id,
+                )
             else:
-                await message.client.send_file(chat_id, io.BytesIO(img), reply_to=message.id)
+                await message.client.send_file(
+                    chat_id, io.BytesIO(img),
+                    reply_to=message.id,
+                )
 
         if reply_text:
-            await message.respond(_md_to_html(reply_text), parse_mode="html")
+            await message.client.send_message(
+                chat_id,
+                _md_to_html(reply_text),
+                parse_mode="html",
+                reply_to=message.id,  # ← завжди реплай на повідомлення що спричинило реакцію
+            )
 
     async def _watcher_call(
         self,
         agent_id: str | None,
         history: collections.deque,
         text: str,
-        label: str | None,
+        sender_name: str | None,
+        is_group: bool,
+        group_title: str | None,
         extra_context: list | None,
         system_override: str | None,
     ) -> tuple[str, list]:
         if agent_id:
+            # Для Mistral Platform агента — передаємо всю пам'ять як текст
             history_text = "\n".join(
                 f"{'User' if m['role'] == ROLE_USER else 'Assistant'}: {m['content']}"
                 for m in history
@@ -913,12 +1193,19 @@ class MistralModule(loader.Module):
                 agent_id=agent_id,
             )
         else:
-            # Якщо є системний override — тимчасово підмінюємо
             original = self.config["agent_system_prompt"]
             if system_override:
                 self.config["agent_system_prompt"] = system_override
             try:
-                reply_text = await self._chat_history(history, text, label, extra_context)
+                reply_text = await self._chat_history(
+                    history=history,
+                    new_msg=text,
+                    sender_name=sender_name,
+                    is_group=is_group,
+                    group_title=group_title,
+                    extra_context=extra_context,
+                    system_override=system_override,
+                )
             finally:
                 if system_override:
                     self.config["agent_system_prompt"] = original
@@ -928,8 +1215,6 @@ class MistralModule(loader.Module):
     # ════════════════════════════════════════════════════════════════════════════
     # КОМАНДИ
     # ════════════════════════════════════════════════════════════════════════════
-
-    # ── Чат ───────────────────────────────────────────────────────────────────
 
     @loader.command(ru_doc="<питання> — Запитати Mistral AI")
     async def mistral(self, message):
@@ -951,7 +1236,6 @@ class MistralModule(loader.Module):
                 elapsed     = time.monotonic() - t0
                 model_label = f"agent:{agent_id[:8]}"
             elif self.config["agent_stream"]:
-                # Стрімінг
                 await utils.answer(msg, self.strings["streaming_think"])
                 text, model_label, elapsed = await self._stream_to_message(msg, args)
                 images = []
@@ -978,9 +1262,7 @@ class MistralModule(loader.Module):
 
     @loader.command(ru_doc="<питання> — Запитати з контекстом реплаю")
     async def mistralask(self, message):
-        """<питання> — Запитати Mistral з контекстом реплаю АБО вказати текст як контекст+питання.
-        Формат 1: Відповідь на повідомлення + .mistralask <питання>
-        Формат 2: .mistralask <контекст> :: <питання>"""
+        """<питання> — Чат з контекстом реплаю або .mistralask контекст :: питання"""
         if not self._ok():
             return await utils.answer(message, self.strings["no_api_key"])
 
@@ -992,7 +1274,6 @@ class MistralModule(loader.Module):
 
         if reply:
             reply_text = (reply.raw_text or "").strip()
-            # Якщо є реплай і в реплаї є фото — спробуємо OCR
             if not reply_text and reply.photo:
                 try:
                     reply_text = await self._ocr_b64(await reply.download_media(bytes), "image/jpeg")
@@ -1058,7 +1339,7 @@ class MistralModule(loader.Module):
 
     @loader.command(ru_doc="<промт> — Згенерувати зображення через Mistral")
     async def mistralimg(self, message):
-        """<промт> — Генерація зображення (Mistral image_generation tool)"""
+        """<промт> — Генерація зображення"""
         if not self._ok():
             return await utils.answer(message, self.strings["no_api_key"])
         prompt = utils.get_args_raw(message).strip()
@@ -1115,7 +1396,7 @@ class MistralModule(loader.Module):
 
     @loader.command(ru_doc="<agent_id> — Вибрати активного Mistral-агента")
     async def mistraluse(self, message):
-        """<agent_id> — Встановити активного Mistral-агента (або 'none' щоб скинути)"""
+        """<agent_id> — Встановити активного агента (або 'none' щоб скинути)"""
         if not self._ok():
             return await utils.answer(message, self.strings["no_api_key"])
         agent_id = utils.get_args_raw(message).strip()
@@ -1162,7 +1443,7 @@ class MistralModule(loader.Module):
         except RuntimeError as e:
             await utils.answer(msg, self.strings["error"].format(error=e))
 
-    @loader.command(ru_doc="<назва> | <модель> | <інструкція> | [tools] — Створити Mistral-агента")
+    @loader.command(ru_doc="<назва> | <модель> | <інструкція> | [tools] — Створити агента")
     async def mistralcreate(self, message):
         """Формат: <назва> | <модель> | <інструкція> | [web_search,image_generation,code_interpreter]"""
         if not self._ok():
@@ -1171,9 +1452,7 @@ class MistralModule(loader.Module):
         if not raw or "|" not in raw:
             return await utils.answer(
                 message,
-                "<b>❌ Формат:</b> <code>.mistralcreate Назва | модель | Інструкція | tool1,tool2</code>\n"
-                "<b>Tools:</b> <code>web_search</code>, <code>image_generation</code>, "
-                "<code>code_interpreter</code>, <code>web_search_premium</code>",
+                "<b>❌ Формат:</b> <code>.mistralcreate Назва | модель | Інструкція | tool1,tool2</code>",
             )
         parts        = [p.strip() for p in raw.split("|")]
         name         = parts[0] if len(parts) > 0 else "My Agent"
@@ -1216,11 +1495,11 @@ class MistralModule(loader.Module):
         except RuntimeError as e:
             await utils.answer(msg, self.strings["error"].format(error=e))
 
-    # ── Авто-агент (watcher) ───────────────────────────────────────────────────
+    # ── Авто-агент ────────────────────────────────────────────────────────────
 
     @loader.command(ru_doc="— Увімкнути/вимкнути авто-агент у поточному чаті")
     async def mistralauto(self, message):
-        """— Увімкнути/вимкнути авто-агент (ШІ відповідає замість тебе)"""
+        """— Увімкнути/вимкнути авто-агент"""
         chat_id = message.chat_id
         if chat_id in self._auto_chats:
             del self._auto_chats[chat_id]
@@ -1248,12 +1527,49 @@ class MistralModule(loader.Module):
         chat_id = message.chat_id
         if chat_id in self._memory:
             del self._memory[chat_id]
-        # Очистити векторну пам'ять
         if hasattr(self, "_vec_mem"):
             for key in list(self._vec_mem.keys()):
                 if (isinstance(key, tuple) and key[0] == chat_id) or key == chat_id:
                     del self._vec_mem[key]
         await utils.answer(message, self.strings["memory_cleared"].format(chat=chat_id))
+
+    # ── Werwolf команди ───────────────────────────────────────────────────────
+
+    @loader.command(ru_doc="<ключ> — Встановити Werwolf API ключ")
+    async def wwkey(self, message):
+        """<ключ> — Встановити Werwolf API ключ для інтеграції з агентом"""
+        key = utils.get_args_raw(message).strip()
+        if not key:
+            cur = str(self.config["werwolf_api_key"]).strip()
+            if cur:
+                await utils.answer(message, f"🔑 Werwolf ключ: <code>{cur[:6]}***{cur[-4:]}</code>")
+            else:
+                await utils.answer(message, "❌ Werwolf ключ не встановлено.\n<code>.wwkey YOUR_KEY</code>")
+            return
+        self.config["werwolf_api_key"] = key
+        masked = f"{key[:6]}***{key[-4:]}"
+        msg = await utils.answer(message, f"✅ Werwolf ключ збережено: <code>{masked}</code>")
+        await asyncio.sleep(5)
+        try:
+            await message.delete()
+            await (msg[0] if isinstance(msg, list) else msg).delete()
+        except Exception:
+            pass
+
+    @loader.command(ru_doc="— Перевірити Werwolf підключення")
+    async def wwtest(self, message):
+        """— Перевірити Werwolf API підключення"""
+        if not self._ww_ok():
+            return await utils.answer(message, "❌ Werwolf ключ не вказано або інтеграцію вимкнено.")
+        msg = await utils.answer(message, "<code>⏳ Тестую Werwolf...</code>")
+        try:
+            data  = await self._ww_get("api/profile")
+            bal   = data.get("balance", {})
+            coins = bal.get("coins", 0)
+            gold  = bal.get("gold", 0)
+            await utils.answer(msg, f"✅ <b>Werwolf API працює</b>\n⭐ {coins:.0f}  🥇 {gold:.1f}")
+        except RuntimeError as e:
+            await utils.answer(msg, f"❌ <b>Помилка:</b> <code>{e}</code>")
 
     # ── Інструменти ───────────────────────────────────────────────────────────
 
@@ -1284,7 +1600,7 @@ class MistralModule(loader.Module):
         except RuntimeError as e:
             await utils.answer(msg, self.strings["error"].format(error=e))
 
-    @loader.command(ru_doc="— OCR зображення або PDF (відповідь на медіа)")
+    @loader.command(ru_doc="— OCR зображення або PDF")
     async def mistralocr(self, message):
         """— OCR зображення/PDF"""
         if not self._ok():
@@ -1329,7 +1645,7 @@ class MistralModule(loader.Module):
         except RuntimeError as e:
             await utils.answer(msg, self.strings["error"].format(error=e))
 
-    @loader.command(ru_doc="— Транскрипція аудіо (відповідь на аудіо)")
+    @loader.command(ru_doc="— Транскрипція аудіо")
     async def mistraltranscribe(self, message):
         """— Транскрипція голосового/аудіо"""
         if not self._ok():
@@ -1394,7 +1710,7 @@ class MistralModule(loader.Module):
         except RuntimeError as e:
             await utils.answer(msg, self.strings["error"].format(error=e))
 
-    @loader.command(ru_doc="— Статистика використання MistralAI")
+    @loader.command(ru_doc="— Статистика використання")
     async def mistralstats(self, message):
         """— Статистика запитів та аптайм"""
         await utils.answer(
@@ -1404,22 +1720,17 @@ class MistralModule(loader.Module):
 
     @loader.command(ru_doc="— Перевірити статус залежностей")
     async def mistraldeps(self, message):
-        """— Перевірити/встановити залежності (langdetect, numpy)"""
+        """— Перевірити залежності"""
+        ww_status = "✅" if self._ww_ok() else ("⚠️ немає ключа" if not self.config["werwolf_api_key"] else "❌ вимкнено")
         lines = [
-            f"{'✅' if _HAS_LANGDETECT else '❌'} <code>langdetect</code> — авто-визначення мови",
+            f"{'✅' if _HAS_LANGDETECT else '❌'} <code>langdetect</code> — авто-мова",
             f"{'✅' if _HAS_NUMPY else '❌'} <code>numpy</code> — векторна пам'ять",
+            f"{ww_status} <code>werwolf</code> — ігрова інтеграція",
         ]
-        if not _HAS_LANGDETECT or not _HAS_NUMPY:
-            lines.append(
-                "\n<i>Для встановлення: виконується автоматично при перезапуску модуля.\n"
-                "Або вручну через термінал: <code>pip install langdetect numpy</code></i>"
-            )
         await utils.answer(
             message,
             self.strings["deps_status"].format(status="\n".join(lines)),
         )
-
-    # ── Довідка ───────────────────────────────────────────────────────────────
 
     @loader.command(ru_doc="— Список команд")
     async def mistralhelp(self, message):
@@ -1429,13 +1740,15 @@ class MistralModule(loader.Module):
             f"(<b>{self._active_agent_name}</b>)"
             if self._active_agent_id else ""
         )
+        ww = "✅" if self._ww_ok() else "❌"
         deps = (
             f"\n<b>📦 Deps:</b> langdetect={'✅' if _HAS_LANGDETECT else '❌'} "
-            f"numpy={'✅' if _HAS_NUMPY else '❌'}"
+            f"numpy={'✅' if _HAS_NUMPY else '❌'} "
+            f"werwolf={ww}"
         )
         await utils.answer(
             message,
-            f"<b>🤖 MistralAI v4 — команди:</b>{active}{deps}\n\n"
+            f"<b>🤖 MistralAI v4.1 — команди:</b>{active}{deps}\n\n"
             "<b>💬 Чат</b>\n"
             "<code>.mistral &lt;питання&gt;</code> — Чат\n"
             "<code>.mistralask [питання]</code> — Чат з контекстом реплаю\n"
@@ -1454,6 +1767,10 @@ class MistralModule(loader.Module):
             "<code>.mistralauto</code> — Увімк/вимк у чаті\n"
             "<code>.mistralautolist</code> — Активні чати\n"
             "<code>.mistralclear</code> — Очистити пам'ять\n\n"
+            "<b>🎮 Werwolf інтеграція</b>\n"
+            "<code>.wwkey &lt;ключ&gt;</code> — Встановити Werwolf ключ\n"
+            "<code>.wwtest</code> — Перевірити підключення\n"
+            "<i>Агент сам звертається до Werwolf коли питають про статистику/монети/петів тощо</i>\n\n"
             "<b>🛠 Інструменти</b>\n"
             "<code>.mistralocr</code> — OCR фото/PDF\n"
             "<code>.mistralvoice &lt;текст&gt;</code> — TTS\n"
