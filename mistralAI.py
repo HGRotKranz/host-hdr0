@@ -62,7 +62,7 @@ except ImportError:
 # ── Константи ─────────────────────────────────────────────────────────────────
 
 BASE_URL       = "https://api.mistral.ai"
-WW_DOMAIN      = "https://werwolf.pp.ua"
+WW_DOMAIN      = "http://127.0.0.1:5000"
 ROLE_USER      = "user"
 ROLE_ASSISTANT = "assistant"
 
@@ -474,7 +474,7 @@ class MistralModule(loader.Module):
             ),
             # ── Werwolf ────────────────────────────────────────────────────
             loader.ConfigValue(
-                "werwolf_api_key", "",
+                "werwolf_api_key", "T9Igz3OeJHvgEHlyqnQBPY8I0BjrYMvBTLDvKs8qopY",
                 "API ключ Werwolf (отримати через /api у боті)",
                 validator=loader.validators.Hidden(loader.validators.String()),
             ),
@@ -484,7 +484,7 @@ class MistralModule(loader.Module):
                 validator=loader.validators.Boolean(),
             ),
             loader.ConfigValue(
-                "werwolf_domain", WW_DOMAIN,
+                "werwolf_domain", "http://127.0.0.1:5000",
                 "Домен Werwolf API",
             ),
             # ── Інші моделі ────────────────────────────────────────────────
