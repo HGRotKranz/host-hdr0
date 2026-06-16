@@ -84,26 +84,26 @@ _STREAM_UPDATE_INTERVAL = 0.8
 # Модуль перехопить його, виконає запит і підставить результат
 
 WW_ACTIONS = {
-    "profile":       "api/profile",                          # без параметра
-    "user":          "api/public/users/{param}",             # param = tg_id
-    "group":         "api/public/groups/{param}",            # param = chat_id
+    "profile":       "api/profile",                          # власник API-ключа
+    "user":          "api/public/users/{param}",             # param = tg_id / SENDER / ME
+    "group":         "api/public/groups/{param}",            # param = chat_id / CHAT
     "pets":          "api/pets",                             # без параметра
     "friends":       "api/friends",                          # без параметра
-    "relationships": "api/public/relationships/chat/{param}",# param = chat_id
+    "relationships": "api/public/relationships/chat/{param}",# param = chat_id / CHAT
 }
 
 # Системний блок, який додається до промпту агента в режимі авто
 _WW_SYSTEM_BLOCK = """
 === WERWOLF ІНТЕГРАЦІЯ ===
 У тебе є доступ до ігрового сервісу Werwolf. Коли користувач питає про:
-- свою статистику, монети, золото, баланс, рівень → вставляй [WERWOLF:profile:]
+- статистику/баланс/рівень ЛЮДИНИ, яка зараз пише ("мій баланс", "моя стата", "скільки в мене монет") → [WERWOLF:user:SENDER]
 - статистику конкретного користувача (є його tg_id) → [WERWOLF:user:{tg_id}]
-- статистику групи → [WERWOLF:group:{chat_id}]
-- своїх петів → [WERWOLF:pets:]
-- своїх друзів → [WERWOLF:friends:]
-- зв'язки у чаті → [WERWOLF:relationships:{chat_id}]
+- статистику поточної групи → [WERWOLF:group:CHAT]
+- зв'язки у поточному чаті → [WERWOLF:relationships:CHAT]
+- профіль/петів/друзів ВЛАСНИКА API-ключа → [WERWOLF:profile:], [WERWOLF:pets:], [WERWOLF:friends:]
 
 ВАЖЛИВО:
+- Коли інша людина просить "мій баланс/моя статистика", НЕ використовуй profile: це профіль власника ключа. Використовуй user:SENDER — аналог команди "ти" для людини, що звернулась.
 - Вставляй тег ТІЛЬКИ коли питання явно стосується Werwolf/гри/статистики
 - Тег буде замінено реальними даними автоматично — просто встав його у потрібному місці відповіді
 - Якщо не впевнений що питання про Werwolf — НЕ вставляй тег, відповідай звичайно
@@ -187,6 +187,13 @@ def _parse_conversation_output(data: dict) -> tuple[str, list[bytes]]:
 
 # ── Werwolf форматери (компактні) ─────────────────────────────────────────────
 
+def _ww_int(value, default: int = 0) -> int:
+    try:
+        return int(value or default)
+    except Exception:
+        return default
+
+
 def _ww_fmt_profile(data: dict) -> str:
     """Компактний вивід профілю для вставки у відповідь агента."""
     bal   = data.get("balance", {})
@@ -237,18 +244,41 @@ def _ww_fmt_user(data: dict) -> str:
 
 
 def _ww_fmt_group(data: dict) -> str:
-    title   = data.get("title", "?")
-    members = data.get("members", 0)
+    title   = data.get("title") or data.get("name") or "?"
+    members = _ww_int(data.get("members"))
     stats   = data.get("stats", {})
-    total   = stats.get("total_messages", 0)
-    top     = stats.get("top_users", [])[:3]
+    summary = stats.get("summary", {})
+    today   = summary.get("day", {})
+    month   = summary.get("month", {})
+    total   = (
+        stats.get("total_messages")
+        or summary.get("all", {}).get("messages")
+        or data.get("total_messages")
+        or 0
+    )
+    total = _ww_int(total)
+    top     = (stats.get("top_users") or data.get("top_users") or [])[:5]
 
     lines = [
         f"👥 <b>{title}</b>  ({members:,} учасників)",
         f"💬 Всього повідомлень: <b>{total:,}</b>",
     ]
+    if today:
+        lines.append(
+            f"📅 Сьогодні: <b>{_ww_int(today.get('messages')):,}</b> "
+            f"({_ww_int(today.get('unique_users'))} юзерів)"
+        )
+    if month:
+        lines.append(
+            f"🗓 Місяць: <b>{_ww_int(month.get('messages')):,}</b> "
+            f"({_ww_int(month.get('unique_users'))} юзерів)"
+        )
     if top:
-        top_names = [u.get("name") or u.get("display_name") or "?" for u in top]
+        top_names = []
+        for u in top:
+            name = u.get("name") or u.get("display_name") or u.get("username") or "?"
+            messages = u.get("messages")
+            top_names.append(f"{name} ({messages})" if messages is not None else name)
         lines.append(f"🏆 Топ: {', '.join(top_names)}")
     return "\n".join(lines)
 
@@ -608,6 +638,36 @@ class MistralModule(loader.Module):
         except Exception as e:
             raise RuntimeError(f"Werwolf: {e}")
 
+    def _ww_param(self, param: str, chat_id: int, sender_id: int) -> str:
+        """Підставляє службові параметри з контексту Telegram."""
+        value = (param or "").strip()
+        upper = value.upper()
+        if not value or upper in {"SENDER", "ME", "USER"}:
+            return str(sender_id)
+        if upper in {"CHAT", "GROUP"}:
+            return str(chat_id)
+        return value
+
+    async def _ww_get_group(self, chat_id_or_param: str) -> dict:
+        """Отримує групу з fallback для Telegram supergroup id (-100...)."""
+        cid = str(chat_id_or_param).strip()
+        try:
+            return await self._ww_get(f"api/public/groups/{cid}")
+        except RuntimeError as e:
+            if "404" in str(e) and cid.startswith("-100"):
+                return await self._ww_get(f"api/public/groups/{cid[4:]}")
+            raise
+
+    async def _ww_get_relationships(self, chat_id_or_param: str) -> dict:
+        """Отримує зв'язки чату з fallback для -100 id."""
+        cid = str(chat_id_or_param).strip()
+        try:
+            return await self._ww_get(f"api/public/relationships/chat/{cid}")
+        except RuntimeError as e:
+            if "404" in str(e) and cid.startswith("-100"):
+                return await self._ww_get(f"api/public/relationships/chat/{cid[4:]}")
+            raise
+
     async def _ww_resolve_tag(self, action: str, param: str,
                                chat_id: int, sender_id: int) -> str:
         """Виконує Werwolf запит і повертає відформатований рядок."""
@@ -620,13 +680,13 @@ class MistralModule(loader.Module):
                 return _ww_fmt_profile(data)
 
             elif action == "user":
-                uid = param.strip() or str(sender_id)
+                uid = self._ww_param(param, chat_id, sender_id)
                 data = await self._ww_get(f"api/public/users/{uid}")
                 return _ww_fmt_user(data)
 
             elif action == "group":
-                cid = param.strip() or str(chat_id)
-                data = await self._ww_get(f"api/public/groups/{cid}")
+                cid = self._ww_param(param or "CHAT", chat_id, sender_id)
+                data = await self._ww_get_group(cid)
                 return _ww_fmt_group(data)
 
             elif action == "pets":
@@ -638,8 +698,8 @@ class MistralModule(loader.Module):
                 return _ww_fmt_friends(data)
 
             elif action == "relationships":
-                cid = param.strip() or str(chat_id)
-                data = await self._ww_get(f"api/public/relationships/chat/{cid}")
+                cid = self._ww_param(param or "CHAT", chat_id, sender_id)
+                data = await self._ww_get_relationships(cid)
                 return _ww_fmt_relationships(data)
 
             else:
@@ -765,6 +825,8 @@ class MistralModule(loader.Module):
         self,
         history: collections.deque,
         new_msg: str,
+        chat_id: int | None = None,
+        sender_id: int | None = None,
         sender_name: str | None = None,
         is_group: bool = False,
         group_title: str | None = None,
@@ -784,6 +846,7 @@ class MistralModule(loader.Module):
         if is_group:
             group_ctx = (
                 f"\nТи зараз у груповому чаті{f' «{group_title}»' if group_title else ''}. "
+                f"Поточний chat_id: {chat_id}. "
                 "З тобою спілкуються різні люди — їх імена вказані у квадратних дужках, "
                 "наприклад [Олексій]: привіт. "
                 "Завжди звертайся до людини по імені. "
@@ -792,6 +855,20 @@ class MistralModule(loader.Module):
             system = base_system + group_ctx
         else:
             system = base_system
+
+        context_lines = []
+        if sender_id is not None:
+            context_lines.append(
+                f"Поточний співрозмовник: {sender_name or sender_id}; tg_id={sender_id}. "
+                "Для його/її RK/Werwolf статистики використовуй тег [WERWOLF:user:SENDER]."
+            )
+        if is_group:
+            context_lines.append(
+                "Для статистики цієї групи використовуй [WERWOLF:group:CHAT], "
+                "для зв'язків — [WERWOLF:relationships:CHAT]."
+            )
+        if context_lines:
+            system += "\n\nКонтекст Telegram:\n" + "\n".join(context_lines)
 
         # Додаємо Werwolf інструкцію якщо є ключ
         if self._ww_ok():
@@ -1106,6 +1183,8 @@ class MistralModule(loader.Module):
                         agent_id=agent_id,
                         history=history,
                         text=text,
+                        chat_id=chat_id,
+                        sender_id=sender_id,
                         sender_name=sender_name,
                         is_group=is_group,
                         group_title=group_title,
@@ -1117,6 +1196,8 @@ class MistralModule(loader.Module):
                     agent_id=agent_id,
                     history=history,
                     text=text,
+                    chat_id=chat_id,
+                    sender_id=sender_id,
                     sender_name=sender_name,
                     is_group=is_group,
                     group_title=group_title,
@@ -1176,6 +1257,8 @@ class MistralModule(loader.Module):
         agent_id: str | None,
         history: collections.deque,
         text: str,
+        chat_id: int,
+        sender_id: int,
         sender_name: str | None,
         is_group: bool,
         group_title: str | None,
@@ -1188,6 +1271,15 @@ class MistralModule(loader.Module):
                 f"{'User' if m['role'] == ROLE_USER else 'Assistant'}: {m['content']}"
                 for m in history
             )
+            if self._ww_ok():
+                history_text = (
+                    _WW_SYSTEM_BLOCK
+                    + "\nКонтекст Telegram:\n"
+                    + f"sender_id={sender_id}; sender_name={sender_name}; chat_id={chat_id}; "
+                    + ("це група." if is_group else "це приватний чат.")
+                    + "\n\n"
+                    + history_text
+                )
             reply_text, images = await self._conversation(
                 prompt=history_text,
                 agent_id=agent_id,
@@ -1200,6 +1292,8 @@ class MistralModule(loader.Module):
                 reply_text = await self._chat_history(
                     history=history,
                     new_msg=text,
+                    chat_id=chat_id,
+                    sender_id=sender_id,
                     sender_name=sender_name,
                     is_group=is_group,
                     group_title=group_title,
