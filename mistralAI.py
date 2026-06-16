@@ -1,7 +1,7 @@
 # meta developer: @RotKranz
-# meta syntax: .mistral <питання> | .mistralvoice <текст> | .mistralocr | .mistralmodels | .mistralagent
+# meta syntax: .mistral | .mistralimg | .mistralagent | .mistralagentadd
 
-__version__ = (2, 0, 0)
+__version__ = (3, 0, 0)
 
 import asyncio
 import base64
@@ -10,7 +10,7 @@ import io
 import logging
 import re
 import time
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import aiohttp
 from .. import loader, utils
@@ -19,238 +19,250 @@ logger = logging.getLogger(__name__)
 
 BASE_URL = "https://api.mistral.ai"
 
-# Типи ролей для пам'яті
-ROLE_USER = "user"
+ROLE_USER      = "user"
 ROLE_ASSISTANT = "assistant"
+
+# Вбудовані інструменти агента
+TOOL_WEB_SEARCH   = {"type": "web_search"}
+TOOL_CODE_INTERP  = {"type": "code_interpreter"}
+TOOL_IMAGE_GEN    = {"type": "image_generation"}
+TOOL_WEB_PREMIUM  = {"type": "web_search_premium"}
 
 
 def _md_to_html(text: str) -> str:
-    """Конвертує markdown у HTML-теги для Telegram."""
     text = re.sub(
         r"```(\w+)?\n?(.*?)```",
         lambda m: f"<pre><code>{m.group(2).strip()}</code></pre>",
-        text,
-        flags=re.DOTALL,
+        text, flags=re.DOTALL,
     )
     text = re.sub(r"`([^`]+)`", r"<code>\1</code>", text)
-    text = re.sub(
-        r"\*\*(.+?)\*\*|__(.+?)__",
-        lambda m: f"<b>{m.group(1) or m.group(2)}</b>",
-        text,
-    )
-    text = re.sub(
-        r"\*(.+?)\*|_(.+?)_",
-        lambda m: f"<i>{m.group(1) or m.group(2)}</i>",
-        text,
-    )
+    text = re.sub(r"\*\*(.+?)\*\*|__(.+?)__",
+                  lambda m: f"<b>{m.group(1) or m.group(2)}</b>", text)
+    text = re.sub(r"\*(.+?)\*|_(.+?)_",
+                  lambda m: f"<i>{m.group(1) or m.group(2)}</i>", text)
     return text.strip()
+
+
+def _parse_conversation_output(data: dict) -> tuple[str, list[bytes]]:
+    """
+    Парсить ConversationResponse.
+    Повертає (text, [image_bytes, ...]).
+    Зображення повертаються як data:image/png;base64,... або URL.
+    """
+    texts: list[str] = []
+    images: list[bytes] = []
+
+    for output in data.get("outputs", []):
+        content = output.get("content", "")
+        if isinstance(content, str):
+            texts.append(content)
+        elif isinstance(content, list):
+            for chunk in content:
+                ctype = chunk.get("type", "")
+                if ctype == "text":
+                    texts.append(chunk.get("text", ""))
+                elif ctype == "image_url":
+                    img = chunk.get("image_url", "")
+                    url = img if isinstance(img, str) else img.get("url", "")
+                    if url.startswith("data:"):
+                        # base64 inline
+                        b64 = url.split(",", 1)[-1]
+                        images.append(base64.b64decode(b64))
+                    elif url:
+                        images.append(url.encode())  # зберігаємо URL як bytes
+    return "\n".join(texts).strip(), images
 
 
 @loader.tds
 class MistralModule(loader.Module):
-    """Повноцінний Mistral AI — чат, OCR, TTS, транскрипція, ембединги, агент-режим."""
+    """Mistral AI: чат, зображення, OCR, TTS, транскрипція, агент-режим, Mistral Agents."""
 
     strings = {
         "name": "MistralAI",
-        "no_api_key": "<b>🔑 Спочатку встанови API ключ у налаштуваннях модуля!</b>",
-        "no_args": "<b>❌ Введи аргумент після команди!</b>",
-        "loading": "<b>⏳ Опрацьовую...</b>",
-        "error": "<b>❌ Помилка:</b> <code>{error}</code>",
+        "no_api_key":  "<b>🔑 Спочатку встанови API ключ у <code>.config MistralAI</code>!</b>",
+        "no_args":     "<b>❌ Введи аргумент після команди!</b>",
+        "loading":     "<b>⏳ Опрацьовую...</b>",
+        "generating":  "<b>🎨 Генерую зображення...</b>",
+        "error":       "<b>❌ Помилка:</b> <code>{error}</code>",
         # chat
         "chat_answer": (
-            "<b>👤 Питання:</b> {question}\n"
-            "<b>🤖 Відповідь:</b>\n{answer}\n\n"
+            "<b>👤</b> {question}\n"
+            "<b>🤖</b> {answer}\n\n"
             "<i>⚡ {model} • {time:.1f}с</i>"
         ),
+        # image
+        "img_caption": "🎨 <i>{prompt}</i>",
+        "img_no_result": "<b>❌ Зображення не згенеровано. Спробуй інший промт.</b>",
+        # agents (Mistral Platform)
+        "agents_header":    "<b>🤖 Твої Mistral агенти:</b>\n\n",
+        "agents_empty":     "<b>🤖 У тебе ще немає агентів на Mistral.</b>",
+        "agent_created":    "✅ <b>Агент створено!</b>\nID: <code>{id}</code>\nНазва: <b>{name}</b>",
+        "agent_deleted":    "🗑 <b>Агент видалено:</b> <code>{id}</code>",
+        "agent_set":        "✅ <b>Поточний агент:</b> <code>{id}</code> (<b>{name}</b>)",
+        "agent_unset":      "ℹ️ <b>Агент скинуто.</b> Використовується звичайна модель.",
+        "agent_info":       (
+            "<b>🤖 Агент:</b> <code>{id}</code>\n"
+            "<b>Назва:</b> {name}\n"
+            "<b>Модель:</b> {model}\n"
+            "<b>Інструменти:</b> {tools}\n"
+            "<b>Інструкція:</b>\n<i>{instructions}</i>"
+        ),
+        # режим-агент (автовідповідь)
+        "autoagent_on":     "🤖 <b>Авто-агент увімкнено</b> у чаті <code>{chat}</code>",
+        "autoagent_off":    "😴 <b>Авто-агент вимкнено</b> у чаті <code>{chat}</code>",
+        "autoagent_list_empty": "<b>🤖 Авто-агент ніде не активний.</b>",
+        "autoagent_list":   "<b>🤖 Активні авто-агент чати:</b>\n{chats}",
+        "memory_cleared":   "🧹 <b>Пам'ять очищена</b> у чаті <code>{chat}</code>",
         # моделі
-        "models_header": "<b>📋 Доступні моделі Mistral:</b>\n\n",
-        # ocr
-        "ocr_result": "<b>📄 OCR результат:</b>\n\n{text}",
-        "ocr_no_media": "<b>❌ Відповідь на повідомлення з фото або PDF-файлом!</b>",
-        # embeddings
-        "embed_result": (
+        "models_header":    "<b>📋 Доступні моделі:</b>\n\n",
+        # ocr / tts / transcription
+        "ocr_result":       "<b>📄 OCR:</b>\n\n{text}",
+        "ocr_no_media":     "<b>❌ Відповідь на фото або PDF!</b>",
+        "tts_generating":   "<b>🎙 Генерую голос...</b>",
+        "tts_done":         "<b>🔊 Mistral TTS</b>",
+        "transcription":    "<b>🎤 Транскрипція:</b>\n\n{text}",
+        "no_audio":         "<b>❌ Відповідь на аудіо/голосове повідомлення!</b>",
+        "moderation":       "<b>🛡 Модерація:</b>\nБезпечно: {safe}\nКатегорії: {cats}",
+        "embed_result":     (
             "<b>🔢 Ембединги ({model}):</b>\n"
             "<code>Розмірність: {dim}</code>\n"
             "<code>Перші 5: {preview}</code>"
         ),
-        # tts
-        "tts_generating": "<b>🎙 Генерую голос...</b>",
-        "tts_done": "<b>🔊 Голосове повідомлення</b> (Mistral TTS)",
-        # transcription
-        "transcription_result": "<b>🎤 Транскрипція:</b>\n\n{text}",
-        "transcription_no_audio": "<b>❌ Відповідь на голосове/аудіо повідомлення!</b>",
-        # moderation
-        "moderation_result": (
-            "<b>🛡 Модерація:</b>\n"
-            "Безпечно: {safe}\n"
-            "Категорії: {categories}"
-        ),
-        # agent
-        "agent_enabled": "🤖 <b>Агент-режим увімкнено</b> у чаті <code>{chat}</code>",
-        "agent_disabled": "😴 <b>Агент-режим вимкнено</b> у чаті <code>{chat}</code>",
-        "agent_list_empty": "<b>🤖 Агент-режим зараз ніде не активний.</b>",
-        "agent_list_header": "<b>🤖 Активні агент-чати:</b>\n{chats}",
-        "agent_memory_cleared": "🧹 <b>Пам'ять агента очищено</b> у чаті <code>{chat}</code>",
     }
 
     def __init__(self):
         self.config = loader.ModuleConfig(
-            # ── Основні ──────────────────────────────────────────────────
+            # ── Основні ───────────────────────────────────────
             loader.ConfigValue(
-                "api_key",
-                "",
+                "api_key", "",
                 "Mistral API Key (https://console.mistral.ai)",
                 validator=loader.validators.Hidden(loader.validators.String()),
             ),
             loader.ConfigValue(
-                "chat_model",
-                "mistral-large-latest",
-                "Модель для чату (mistral-large-latest, mistral-small-latest, codestral-latest тощо)",
+                "chat_model", "mistral-large-latest",
+                "Модель для .mistral (mistral-large-latest, codestral-latest, …)",
             ),
             loader.ConfigValue(
                 "system_prompt",
                 "Ти — корисний асистент. Відповідай чітко і зрозуміло.",
-                "Системний промпт для звичайного чату (.mistral)",
+                "Системний промпт для .mistral",
             ),
-            loader.ConfigValue("max_tokens", 1024, "Ліміт токенів відповіді"),
-            loader.ConfigValue("timeout", 120, "Таймаут запиту (секунди)"),
-            # ── Агент-режим ───────────────────────────────────────────────
+            loader.ConfigValue("max_tokens", 1024, "Ліміт токенів"),
+            loader.ConfigValue("timeout", 120, "Таймаут (с)"),
+            # ── Авто-агент (watcher) ───────────────────────────
             loader.ConfigValue(
                 "agent_system_prompt",
                 (
-                    "Ти — особистий асистент власника цього акаунту. "
+                    "Ти — особистий асистент власника цього Telegram-акаунту. "
                     "Спілкуйся природно, як жива людина. "
-                    "Не розкривай, що ти ШІ, якщо тебе не запитують прямо. "
                     "Відповідай коротко і по суті."
                 ),
-                "Системний промпт агента (хто він, як поводиться)",
+                "Промпт поведінки авто-агента (хто він, як поводиться)",
             ),
             loader.ConfigValue(
-                "agent_model",
-                "mistral-large-latest",
-                "Модель для агент-режиму",
+                "agent_model", "mistral-large-latest",
+                "Модель для авто-агента",
             ),
             loader.ConfigValue(
-                "agent_history_limit",
-                50,
-                "Кількість повідомлень у пам'яті агента (на кожен чат/користувача)",
+                "agent_mistral_id", "",
+                "ID Mistral-агента для авто-режиму (якщо порожньо — використовується модель+промпт)",
+            ),
+            loader.ConfigValue(
+                "agent_history_limit", 50,
+                "Глибина пам'яті авто-агента (повідомлень на чат/юзера)",
                 validator=loader.validators.Integer(minimum=5, maximum=500),
             ),
             loader.ConfigValue(
-                "agent_typing_delay",
-                True,
-                "Показувати 'друкує...' перед відповіддю агента",
+                "agent_typing", True,
+                "Показувати 'друкує...' перед відповіддю",
                 validator=loader.validators.Boolean(),
             ),
             loader.ConfigValue(
-                "agent_show_name_in_group",
-                True,
-                "Показувати ім'я співрозмовника у груповому чаті при відповіді агента",
+                "agent_show_name_in_group", True,
+                "Підписувати ім'я у групових чатах",
                 validator=loader.validators.Boolean(),
             ),
-            # ── Інші моделі ───────────────────────────────────────────────
+            # ── Інші моделі ────────────────────────────────────
+            loader.ConfigValue("ocr_model",            "mistral-ocr-latest",   "Модель OCR"),
+            loader.ConfigValue("tts_model",            "mistral-tts-latest",   "Модель TTS"),
+            loader.ConfigValue("tts_voice",            "fr:emma",              "Голос TTS (lang:name)"),
+            loader.ConfigValue("transcription_model",  "voxtral-mini-2507",    "Модель транскрипції"),
+            loader.ConfigValue("embed_model",          "mistral-embed",        "Модель ембединів"),
+            # ── Генерація зображень ───────────────────────────
             loader.ConfigValue(
-                "ocr_model",
-                "mistral-ocr-latest",
-                "Модель для OCR",
-            ),
-            loader.ConfigValue(
-                "tts_model",
-                "mistral-tts-latest",
-                "Модель для синтезу мовлення (TTS)",
-            ),
-            loader.ConfigValue(
-                "tts_voice",
-                "fr:emma",
-                "Голос для TTS (формат lang:name, наприклад en:charlie, fr:emma)",
-            ),
-            loader.ConfigValue(
-                "transcription_model",
-                "voxtral-mini-2507",
-                "Модель для транскрипції аудіо",
-            ),
-            loader.ConfigValue(
-                "embed_model",
-                "mistral-embed",
-                "Модель для ембединів",
+                "image_model", "mistral-large-latest",
+                "Модель для генерації зображень (використовує image_generation tool)",
             ),
         )
         self._session: aiohttp.ClientSession | None = None
         self._me = None
 
-        # {chat_id: True}  — чати де увімкнено агент-режим
-        self._agent_chats: Dict[int, bool] = {}
-
-        # Пам'ять агента:
-        # Для приватних чатів: {chat_id: deque([{role, content}])}
-        # Для групових:        {chat_id: {user_id: deque([{role, content}])}}
-        self._agent_memory: Dict[int, object] = {}
+        # авто-агент: {chat_id: True}
+        self._auto_chats: Dict[int, bool] = {}
+        # пам'ять: {chat_id: deque} або {chat_id: {user_id: deque}}
+        self._memory: Dict[int, object] = {}
+        # поточний активний Mistral-агент (platform agent)
+        self._active_agent_id: Optional[str] = None
+        self._active_agent_name: Optional[str] = None
 
     # ── Lifecycle ──────────────────────────────────────────────────────────
 
     async def client_ready(self, client, db):
         self._session = aiohttp.ClientSession()
         self._me = await client.get_me()
-        # Відновлюємо список активних чатів з бази хікки
-        saved = self.db.get("MistralAI", "agent_chats", [])
-        self._agent_chats = {int(cid): True for cid in saved}
+        saved = self.db.get("MistralAI", "auto_chats", [])
+        self._auto_chats = {int(c): True for c in saved}
+        self._active_agent_id   = self.db.get("MistralAI", "active_agent_id", "")   or None
+        self._active_agent_name = self.db.get("MistralAI", "active_agent_name", "") or None
 
     async def on_unload(self):
         if self._session:
             await self._session.close()
 
-    # ── Helpers ────────────────────────────────────────────────────────────
+    # ── Internal helpers ───────────────────────────────────────────────────
 
-    def _headers(self) -> dict:
-        return {
-            "Authorization": f"Bearer {self.config['api_key']}",
-            "Content-Type": "application/json",
-        }
+    def _h(self) -> dict:
+        return {"Authorization": f"Bearer {self.config['api_key']}",
+                "Content-Type": "application/json"}
 
-    def _timeout(self) -> aiohttp.ClientTimeout:
+    def _to(self) -> aiohttp.ClientTimeout:
         return aiohttp.ClientTimeout(total=self.config["timeout"])
 
-    def _check_key(self) -> bool:
+    def _ok(self) -> bool:
         return bool(self.config["api_key"].strip())
 
-    def _save_agent_chats(self):
-        self.db.set("MistralAI", "agent_chats", list(self._agent_chats.keys()))
+    def _save_auto(self):
+        self.db.set("MistralAI", "auto_chats", list(self._auto_chats.keys()))
 
-    def _get_history(self, chat_id: int, user_id: int | None = None) -> collections.deque:
-        """Повертає deque з пам'яттю для даного чату/юзера."""
-        limit = self.config["agent_history_limit"]
+    def _save_active_agent(self):
+        self.db.set("MistralAI", "active_agent_id",   self._active_agent_id   or "")
+        self.db.set("MistralAI", "active_agent_name", self._active_agent_name or "")
+
+    def _get_mem(self, chat_id: int, user_id: Optional[int] = None) -> collections.deque:
+        lim = self.config["agent_history_limit"]
         if user_id is not None:
-            # Груповий чат — окрема пам'ять для кожного учасника
-            if chat_id not in self._agent_memory:
-                self._agent_memory[chat_id] = {}
-            group_mem = self._agent_memory[chat_id]
-            if user_id not in group_mem:
-                group_mem[user_id] = collections.deque(maxlen=limit)
-            return group_mem[user_id]
+            if chat_id not in self._memory:
+                self._memory[chat_id] = {}
+            grp = self._memory[chat_id]
+            if user_id not in grp:
+                grp[user_id] = collections.deque(maxlen=lim)
+            return grp[user_id]
         else:
-            # Приватний чат
-            if chat_id not in self._agent_memory:
-                self._agent_memory[chat_id] = collections.deque(maxlen=limit)
-            return self._agent_memory[chat_id]
+            if chat_id not in self._memory:
+                self._memory[chat_id] = collections.deque(maxlen=lim)
+            return self._memory[chat_id]
 
-    def _push_message(self, history: collections.deque, role: str, content: str):
-        history.append({"role": role, "content": content})
+    # ── Low-level HTTP ─────────────────────────────────────────────────────
 
     async def _post(self, path: str, payload: dict, headers: dict | None = None) -> dict:
         url = f"{BASE_URL}{path}"
-        h = headers or self._headers()
-        t0 = time.monotonic()
+        h = headers or self._h()
         try:
-            async with self._session.post(
-                url, json=payload, headers=h, timeout=self._timeout()
-            ) as resp:
-                data = await resp.json()
-            logger.debug("Mistral %s → %.1fs", path, time.monotonic() - t0)
+            async with self._session.post(url, json=payload, headers=h, timeout=self._to()) as r:
+                data = await r.json()
             if "error" in data:
-                msg = data["error"]
-                if isinstance(msg, dict):
-                    msg = msg.get("message", str(msg))
-                raise RuntimeError(str(msg))
+                err = data["error"]
+                raise RuntimeError(err.get("message", str(err)) if isinstance(err, dict) else str(err))
             return data
         except asyncio.TimeoutError:
             raise RuntimeError(f"таймаут ({self.config['timeout']}с)")
@@ -261,20 +273,23 @@ class MistralModule(loader.Module):
 
     async def _get(self, path: str) -> dict:
         url = f"{BASE_URL}{path}"
-        async with self._session.get(
-            url, headers=self._headers(), timeout=self._timeout()
-        ) as resp:
-            return await resp.json()
+        async with self._session.get(url, headers=self._h(), timeout=self._to()) as r:
+            return await r.json()
 
-    # ── API: Chat ──────────────────────────────────────────────────────────
+    async def _delete(self, path: str) -> dict:
+        url = f"{BASE_URL}{path}"
+        async with self._session.delete(url, headers=self._h(), timeout=self._to()) as r:
+            return await r.json()
 
-    async def _chat(
-        self,
-        prompt: str,
-        model: str | None = None,
-        system: str | None = None,
-    ) -> tuple[str, str, float]:
-        """Простий чат без пам'яті. Повертає (відповідь, модель, час)."""
+    async def _patch(self, path: str, payload: dict) -> dict:
+        url = f"{BASE_URL}{path}"
+        async with self._session.patch(url, json=payload, headers=self._h(), timeout=self._to()) as r:
+            return await r.json()
+
+    # ── API: Chat completions ──────────────────────────────────────────────
+
+    async def _chat(self, prompt: str, model: str | None = None,
+                    system: str | None = None) -> tuple[str, str, float]:
         m = model or self.config["chat_model"]
         sys = system if system is not None else self.config["system_prompt"]
         payload = {
@@ -287,175 +302,192 @@ class MistralModule(loader.Module):
         }
         t0 = time.monotonic()
         data = await self._post("/v1/chat/completions", payload)
-        elapsed = time.monotonic() - t0
         text = data["choices"][0]["message"]["content"]
-        return text, data.get("model", m), elapsed
+        return text, data.get("model", m), time.monotonic() - t0
 
-    async def _chat_with_history(
-        self,
-        history: collections.deque,
-        new_user_msg: str,
-        sender_label: str | None = None,
-    ) -> str:
-        """Чат з контекстом пам'яті для агент-режиму."""
-        model = self.config["agent_model"]
+    async def _chat_history(self, history: collections.deque, new_msg: str,
+                             label: str | None = None) -> str:
+        """Чат з пам'яттю для авто-агента."""
         system = self.config["agent_system_prompt"]
-
-        # Формуємо список повідомлень: system + history + нове
         messages = [{"role": "system", "content": system}]
         messages.extend(list(history))
-
-        # Якщо в групі — вказуємо хто пише
-        content = new_user_msg
-        if sender_label:
-            content = f"[{sender_label}]: {new_user_msg}"
-
+        content = f"[{label}]: {new_msg}" if label else new_msg
         messages.append({"role": ROLE_USER, "content": content})
-
         payload = {
-            "model": model,
+            "model": self.config["agent_model"],
             "max_tokens": self.config["max_tokens"],
             "messages": messages,
         }
         data = await self._post("/v1/chat/completions", payload)
         return data["choices"][0]["message"]["content"]
 
-    # ── API: OCR ───────────────────────────────────────────────────────────
+    # ── API: Conversations (підтримує агентів + image_generation) ─────────
 
-    async def _ocr_base64(self, file_bytes: bytes, media_type: str) -> str:
-        b64 = base64.b64encode(file_bytes).decode()
-        if media_type == "application/pdf":
-            doc = {
-                "type": "base64_document",
-                "document_media_type": media_type,
-                "document_data": b64,
-            }
-        else:
-            doc = {
-                "type": "base64_image",
-                "image_media_type": media_type,
-                "image_data": b64,
-            }
-        payload = {"model": self.config["ocr_model"], "document": doc}
-        data = await self._post("/v1/ocr", payload)
-        pages = data.get("pages", [])
-        return "\n\n---\n\n".join(p.get("markdown", "") for p in pages).strip()
+    async def _conversation(
+        self,
+        prompt: str,
+        tools: list | None = None,
+        agent_id: str | None = None,
+        model: str | None = None,
+        instructions: str | None = None,
+    ) -> tuple[str, list[bytes]]:
+        """
+        Викликає /v1/conversations.
+        Повертає (text, [image_bytes_or_url_bytes]).
+        """
+        payload: dict = {"inputs": prompt, "stream": False}
+        if agent_id:
+            payload["agent_id"] = agent_id
+        elif model:
+            payload["model"] = model
+        if tools:
+            payload["tools"] = tools
+        if instructions:
+            payload["instructions"] = instructions
+        data = await self._post("/v1/conversations", payload)
+        return _parse_conversation_output(data)
 
-    # ── API: Embeddings ────────────────────────────────────────────────────
+    async def _conversation_append(
+        self,
+        conversation_id: str,
+        prompt: str,
+    ) -> tuple[str, list[bytes]]:
+        payload = {"inputs": prompt, "stream": False}
+        data = await self._post(f"/v1/conversations/{conversation_id}", payload)
+        return _parse_conversation_output(data)
+
+    # ── API: Image generation (через Conversations API) ───────────────────
+
+    async def _generate_image(self, prompt: str) -> tuple[str, list[bytes]]:
+        """
+        Генерує зображення через Conversations API з інструментом image_generation.
+        Повертає (text_caption, [image_bytes]).
+        """
+        return await self._conversation(
+            prompt=prompt,
+            tools=[TOOL_IMAGE_GEN],
+            model=self.config["image_model"],
+        )
+
+    # ── API: Platform Agents CRUD ─────────────────────────────────────────
+
+    async def _agents_list(self) -> list:
+        data = await self._get("/v1/agents?page_size=50")
+        return data.get("data", [])
+
+    async def _agent_get(self, agent_id: str) -> dict:
+        return await self._get(f"/v1/agents/{agent_id}")
+
+    async def _agent_create(self, name: str, model: str, instructions: str,
+                             tools: list | None = None) -> dict:
+        payload = {
+            "name": name,
+            "model": model,
+            "instructions": instructions,
+            "tools": tools or [],
+        }
+        return await self._post("/v1/agents", payload)
+
+    async def _agent_update(self, agent_id: str, **kwargs) -> dict:
+        return await self._patch(f"/v1/agents/{agent_id}", kwargs)
+
+    async def _agent_delete(self, agent_id: str) -> dict:
+        return await self._delete(f"/v1/agents/{agent_id}")
+
+    # ── API: OCR ──────────────────────────────────────────────────────────
+
+    async def _ocr_b64(self, data: bytes, mime: str) -> str:
+        b64 = base64.b64encode(data).decode()
+        doc = (
+            {"type": "base64_document", "document_media_type": mime, "document_data": b64}
+            if "pdf" in mime else
+            {"type": "base64_image", "image_media_type": mime, "image_data": b64}
+        )
+        resp = await self._post("/v1/ocr", {"model": self.config["ocr_model"], "document": doc})
+        return "\n\n---\n\n".join(p.get("markdown", "") for p in resp.get("pages", [])).strip()
+
+    # ── API: Embeddings ───────────────────────────────────────────────────
 
     async def _embeddings(self, text: str) -> tuple[list, str]:
-        payload = {
-            "model": self.config["embed_model"],
-            "input": [text],
-            "encoding_format": "float",
-        }
-        data = await self._post("/v1/embeddings", payload)
-        vec = data["data"][0]["embedding"]
-        return vec, data.get("model", self.config["embed_model"])
+        data = await self._post("/v1/embeddings", {
+            "model": self.config["embed_model"], "input": [text], "encoding_format": "float",
+        })
+        return data["data"][0]["embedding"], data.get("model", self.config["embed_model"])
 
-    # ── API: TTS ───────────────────────────────────────────────────────────
+    # ── API: TTS ──────────────────────────────────────────────────────────
 
     async def _tts(self, text: str) -> bytes:
-        payload = {
-            "model": self.config["tts_model"],
-            "voice": self.config["tts_voice"],
-            "input": text,
-            "output_format": "pcm",
-        }
         url = f"{BASE_URL}/v1/audio/speech"
-        headers = {
-            "Authorization": f"Bearer {self.config['api_key']}",
-            "Content-Type": "application/json",
-        }
-        async with self._session.post(
-            url, json=payload, headers=headers, timeout=self._timeout()
-        ) as resp:
-            if resp.status != 200:
-                err = await resp.text()
-                raise RuntimeError(f"TTS error {resp.status}: {err[:200]}")
-            raw = await resp.read()
-
+        h = {"Authorization": f"Bearer {self.config['api_key']}", "Content-Type": "application/json"}
+        payload = {"model": self.config["tts_model"], "voice": self.config["tts_voice"],
+                   "input": text, "output_format": "pcm"}
+        async with self._session.post(url, json=payload, headers=h, timeout=self._to()) as r:
+            if r.status != 200:
+                raise RuntimeError(f"TTS {r.status}: {(await r.text())[:200]}")
+            raw = await r.read()
         # PCM → WAV
-        rate, channels, bits = 24000, 1, 16
-        data_size = len(raw)
+        rate, ch, bits = 24000, 1, 16
         buf = io.BytesIO()
-        buf.write(b"RIFF")
-        buf.write((36 + data_size).to_bytes(4, "little"))
-        buf.write(b"WAVEfmt ")
-        buf.write((16).to_bytes(4, "little"))
-        buf.write((1).to_bytes(2, "little"))
-        buf.write(channels.to_bytes(2, "little"))
-        buf.write(rate.to_bytes(4, "little"))
-        buf.write((rate * channels * bits // 8).to_bytes(4, "little"))
-        buf.write((channels * bits // 8).to_bytes(2, "little"))
-        buf.write(bits.to_bytes(2, "little"))
-        buf.write(b"data")
-        buf.write(data_size.to_bytes(4, "little"))
-        buf.write(raw)
+        buf.write(b"RIFF"); buf.write((36 + len(raw)).to_bytes(4, "little"))
+        buf.write(b"WAVEfmt "); buf.write((16).to_bytes(4, "little"))
+        buf.write((1).to_bytes(2, "little")); buf.write(ch.to_bytes(2, "little"))
+        buf.write(rate.to_bytes(4, "little")); buf.write((rate * ch * bits // 8).to_bytes(4, "little"))
+        buf.write((ch * bits // 8).to_bytes(2, "little")); buf.write(bits.to_bytes(2, "little"))
+        buf.write(b"data"); buf.write(len(raw).to_bytes(4, "little")); buf.write(raw)
         return buf.getvalue()
 
     # ── API: Transcription ────────────────────────────────────────────────
 
-    async def _transcribe(self, audio_bytes: bytes, filename: str = "audio.ogg") -> str:
+    async def _transcribe(self, audio: bytes, fname: str = "audio.ogg") -> str:
         url = f"{BASE_URL}/v1/audio/transcriptions"
-        headers = {"Authorization": f"Bearer {self.config['api_key']}"}
         form = aiohttp.FormData()
         form.add_field("model", self.config["transcription_model"])
-        form.add_field(
-            "file", audio_bytes, filename=filename, content_type="audio/ogg"
-        )
+        form.add_field("file", audio, filename=fname, content_type="audio/ogg")
         async with self._session.post(
-            url, data=form, headers=headers, timeout=self._timeout()
-        ) as resp:
-            data = await resp.json()
-        if "error" in data:
-            raise RuntimeError(str(data["error"]))
-        return data.get("text", "")
+            url, data=form, headers={"Authorization": f"Bearer {self.config['api_key']}"},
+            timeout=self._to()
+        ) as r:
+            d = await r.json()
+        if "error" in d:
+            raise RuntimeError(str(d["error"]))
+        return d.get("text", "")
 
     # ── API: Moderation ───────────────────────────────────────────────────
 
     async def _moderate(self, text: str) -> dict:
-        payload = {"model": "mistral-moderation-latest", "input": text}
-        return await self._post("/v1/moderations", payload)
+        return await self._post("/v1/moderations", {"model": "mistral-moderation-latest", "input": text})
 
     # ── API: Models ───────────────────────────────────────────────────────
 
-    async def _list_models(self) -> list:
-        data = await self._get("/v1/models")
-        return data.get("data", [])
+    async def _models(self) -> list:
+        return (await self._get("/v1/models")).get("data", [])
 
     # ════════════════════════════════════════════════════════════════════════
-    # АГЕНТ-РЕЖИМ: watcher
+    # WATCHER — авто-агент
     # ════════════════════════════════════════════════════════════════════════
 
     async def watcher(self, message):
-        """Перехоплює повідомлення у агент-чатах і відповідає замість власника."""
-        # Пропускаємо власні повідомлення та повідомлення без тексту
         if not message or not hasattr(message, "sender_id"):
             return
-        if not self._check_key():
+        if not self._ok():
             return
-
-        # Чи це наш акаунт? — пропускаємо
         if self._me and message.sender_id == self._me.id:
             return
 
         chat_id = message.chat_id
-        if chat_id not in self._agent_chats:
+        if chat_id not in self._auto_chats:
             return
 
-        text = message.raw_text or ""
-        if not text.strip():
+        text = (message.raw_text or "").strip()
+        if not text:
             return
 
-        # Визначаємо чи це група
         try:
             chat = await message.get_chat()
-            is_group = hasattr(chat, "title")  # Group/Channel мають title
+            is_group = hasattr(chat, "title")
         except Exception:
             is_group = False
 
-        # Отримуємо відправника
         try:
             sender = await message.get_sender()
             sender_name = (
@@ -466,35 +498,68 @@ class MistralModule(loader.Module):
         except Exception:
             sender_name = str(message.sender_id)
 
-        # Для групи — ключ по user_id, для приватного — None
         user_key = message.sender_id if is_group else None
-        history = self._get_history(chat_id, user_key)
+        history = self._get_mem(chat_id, user_key)
 
-        # Додаємо повідомлення користувача в пам'ять
-        self._push_message(history, ROLE_USER, text)
+        # Зберігаємо вхідне повідомлення
+        history.append({"role": ROLE_USER, "content": text})
 
-        # Показуємо "друкує..."
-        if self.config["agent_typing_delay"]:
-            async with message.client.action(chat_id, "typing"):
-                try:
-                    label = sender_name if (is_group and self.config["agent_show_name_in_group"]) else None
-                    reply = await self._chat_with_history(history, text, sender_label=label)
-                except RuntimeError as e:
-                    logger.error("Mistral agent error: %s", e)
-                    return
-        else:
-            try:
-                label = sender_name if (is_group and self.config["agent_show_name_in_group"]) else None
-                reply = await self._chat_with_history(history, text, sender_label=label)
-            except RuntimeError as e:
-                logger.error("Mistral agent error: %s", e)
-                return
+        label = sender_name if (is_group and self.config["agent_show_name_in_group"]) else None
 
-        # Зберігаємо відповідь у пам'яті
-        self._push_message(history, ROLE_ASSISTANT, reply)
+        # Якщо є вибраний Mistral-агент або agent_id у конфігу — використовуємо Conversations API
+        agent_id = (
+            self._active_agent_id
+            or (self.config["agent_mistral_id"].strip() or None)
+        )
 
-        # Надсилаємо відповідь
-        await message.respond(_md_to_html(reply), parse_mode="html")
+        try:
+            if self.config["agent_typing"]:
+                async with message.client.action(chat_id, "typing"):
+                    if agent_id:
+                        # Через Conversations API (stateless — передаємо всю history)
+                        history_text = "\n".join(
+                            f"{'User' if m['role'] == ROLE_USER else 'Assistant'}: {m['content']}"
+                            for m in history
+                        )
+                        reply_text, images = await self._conversation(
+                            prompt=history_text,
+                            agent_id=agent_id,
+                        )
+                    else:
+                        reply_text = await self._chat_history(history, text, label)
+                        images = []
+            else:
+                if agent_id:
+                    history_text = "\n".join(
+                        f"{'User' if m['role'] == ROLE_USER else 'Assistant'}: {m['content']}"
+                        for m in history
+                    )
+                    reply_text, images = await self._conversation(
+                        prompt=history_text,
+                        agent_id=agent_id,
+                    )
+                else:
+                    reply_text = await self._chat_history(history, text, label)
+                    images = []
+        except RuntimeError as e:
+            logger.error("MistralAI watcher error: %s", e)
+            return
+
+        history.append({"role": ROLE_ASSISTANT, "content": reply_text})
+
+        # Відправляємо зображення, якщо є
+        for img in images:
+            if img.startswith(b"http"):
+                await message.client.send_file(chat_id, img.decode(), reply_to=message.id)
+            else:
+                await message.client.send_file(
+                    chat_id,
+                    io.BytesIO(img),
+                    reply_to=message.id,
+                )
+
+        if reply_text:
+            await message.respond(_md_to_html(reply_text), parse_mode="html")
 
     # ════════════════════════════════════════════════════════════════════════
     # КОМАНДИ
@@ -505,38 +570,51 @@ class MistralModule(loader.Module):
     @loader.command(ru_doc="<питання> — Запитати Mistral AI")
     async def mistral(self, message):
         """<питання> — Запитати Mistral AI"""
-        if not self._check_key():
+        if not self._ok():
             return await utils.answer(message, self.strings["no_api_key"])
         args = utils.get_args_raw(message).strip()
         if not args:
             return await utils.answer(message, self.strings["no_args"])
 
+        # Якщо активний Mistral-агент — використовуємо Conversations API
+        agent_id = self._active_agent_id or (self.config["agent_mistral_id"].strip() or None)
+
         msg = await utils.answer(message, self.strings["loading"])
         try:
-            text, model, elapsed = await self._chat(args)
+            if agent_id:
+                t0 = time.monotonic()
+                text, images = await self._conversation(prompt=args, agent_id=agent_id)
+                elapsed = time.monotonic() - t0
+                model_label = f"agent:{agent_id[:8]}"
+            else:
+                text, model_label, elapsed = await self._chat(args)
+                images = []
+
+            # Надсилаємо зображення
+            for img in images:
+                if img.startswith(b"http"):
+                    await message.client.send_file(message.peer_id, img.decode())
+                else:
+                    await message.client.send_file(message.peer_id, io.BytesIO(img))
+
             await utils.answer(
                 msg,
                 self.strings["chat_answer"].format(
-                    question=args,
-                    answer=_md_to_html(text),
-                    model=model,
-                    time=elapsed,
+                    question=args, answer=_md_to_html(text),
+                    model=model_label, time=elapsed,
                 ),
             )
         except RuntimeError as e:
             await utils.answer(msg, self.strings["error"].format(error=e))
 
-    @loader.command(ru_doc="<модель> <питання> — Запит до конкретної моделі")
+    @loader.command(ru_doc="<модель> <питання> — Чат із конкретною моделлю")
     async def mistralm(self, message):
         """<модель> <питання> — Чат із конкретною моделлю"""
-        if not self._check_key():
+        if not self._ok():
             return await utils.answer(message, self.strings["no_api_key"])
         args = utils.get_args_raw(message).strip()
         if not args or " " not in args:
-            return await utils.answer(
-                message,
-                "<b>❌ Формат:</b> <code>.mistralm &lt;модель&gt; &lt;питання&gt;</code>",
-            )
+            return await utils.answer(message, "<b>❌ Формат:</b> <code>.mistralm &lt;модель&gt; &lt;текст&gt;</code>")
         model, _, prompt = args.partition(" ")
         msg = await utils.answer(message, self.strings["loading"])
         try:
@@ -544,84 +622,240 @@ class MistralModule(loader.Module):
             await utils.answer(
                 msg,
                 self.strings["chat_answer"].format(
-                    question=prompt.strip(),
-                    answer=_md_to_html(text),
-                    model=used,
-                    time=elapsed,
+                    question=prompt.strip(), answer=_md_to_html(text),
+                    model=used, time=elapsed,
                 ),
             )
         except RuntimeError as e:
             await utils.answer(msg, self.strings["error"].format(error=e))
 
-    # ── Агент-режим ────────────────────────────────────────────────────────
+    # ── Генерація зображень ───────────────────────────────────────────────
 
-    @loader.command(ru_doc="— Увімкнути/вимкнути агент-режим у поточному чаті")
-    async def mistralagent(self, message):
-        """— Увімкнути/вимкнути агент-режим (ШІ відповідає замість тебе)"""
-        chat_id = message.chat_id
-        if chat_id in self._agent_chats:
-            del self._agent_chats[chat_id]
-            self._save_agent_chats()
-            await utils.answer(
-                message,
-                self.strings["agent_disabled"].format(chat=chat_id),
-            )
-        else:
-            self._agent_chats[chat_id] = True
-            self._save_agent_chats()
-            await utils.answer(
-                message,
-                self.strings["agent_enabled"].format(chat=chat_id),
-            )
+    @loader.command(ru_doc="<промт> — Згенерувати зображення через Mistral")
+    async def mistralimg(self, message):
+        """<промт> — Генерація зображення (Mistral image_generation tool)"""
+        if not self._ok():
+            return await utils.answer(message, self.strings["no_api_key"])
+        prompt = utils.get_args_raw(message).strip()
+        if not prompt:
+            return await utils.answer(message, self.strings["no_args"])
 
-    @loader.command(ru_doc="— Показати всі чати де активний агент-режим")
-    async def mistralagentlist(self, message):
-        """— Список чатів з активним агент-режимом"""
-        if not self._agent_chats:
-            return await utils.answer(message, self.strings["agent_list_empty"])
-        lines = [f"• <code>{cid}</code>" for cid in self._agent_chats]
-        await utils.answer(
-            message,
-            self.strings["agent_list_header"].format(chats="\n".join(lines)),
-        )
+        msg = await utils.answer(message, self.strings["generating"])
+        try:
+            text, images = await self._generate_image(prompt)
 
-    @loader.command(ru_doc="— Очистити пам'ять агента у поточному чаті")
-    async def mistralagentclear(self, message):
-        """— Очистити пам'ять агента (контекст розмови)"""
-        chat_id = message.chat_id
-        if chat_id in self._agent_memory:
-            del self._agent_memory[chat_id]
-        await utils.answer(
-            message,
-            self.strings["agent_memory_cleared"].format(chat=chat_id),
-        )
+            if not images:
+                return await utils.answer(msg, self.strings["img_no_result"])
 
-    # ── Інструменти ────────────────────────────────────────────────────────
+            caption = self.strings["img_caption"].format(prompt=prompt)
+            for img in images:
+                if img.startswith(b"http"):
+                    await message.client.send_file(
+                        message.peer_id, img.decode(), caption=caption, parse_mode="html"
+                    )
+                else:
+                    await message.client.send_file(
+                        message.peer_id, io.BytesIO(img), caption=caption, parse_mode="html"
+                    )
 
-    @loader.command(ru_doc="— Список доступних моделей Mistral")
-    async def mistralmodels(self, message):
-        """— Показати всі доступні моделі"""
-        if not self._check_key():
+            await msg.delete()
+        except RuntimeError as e:
+            await utils.answer(msg, self.strings["error"].format(error=e))
+
+    # ── Mistral Platform Agents ────────────────────────────────────────────
+
+    @loader.command(ru_doc="— Список твоїх Mistral-агентів")
+    async def mistralagents(self, message):
+        """— Список агентів на Mistral Platform"""
+        if not self._ok():
             return await utils.answer(message, self.strings["no_api_key"])
         msg = await utils.answer(message, self.strings["loading"])
         try:
-            models = await self._list_models()
+            agents = await self._agents_list()
+            if not agents:
+                return await utils.answer(msg, self.strings["agents_empty"])
+            lines = []
+            for a in agents:
+                active = " ✅" if a["id"] == self._active_agent_id else ""
+                tools = ", ".join(t.get("type", "?") for t in a.get("tools", [])) or "—"
+                lines.append(
+                    f"• <code>{a['id']}</code> — <b>{a.get('name', '?')}</b>{active}\n"
+                    f"  <i>Модель: {a.get('model','?')} | Інструменти: {tools}</i>"
+                )
+            text = self.strings["agents_header"] + "\n".join(lines)
+            if len(text) > 4096:
+                text = text[:4090] + "\n..."
+            await utils.answer(msg, text)
+        except RuntimeError as e:
+            await utils.answer(msg, self.strings["error"].format(error=e))
+
+    @loader.command(ru_doc="<agent_id> — Вибрати активного Mistral-агента для .mistral та авто-режиму")
+    async def mistraluse(self, message):
+        """<agent_id> — Встановити активного Mistral-агента (або 'none' щоб скинути)"""
+        if not self._ok():
+            return await utils.answer(message, self.strings["no_api_key"])
+        agent_id = utils.get_args_raw(message).strip()
+        if not agent_id:
+            return await utils.answer(message, self.strings["no_args"])
+
+        if agent_id.lower() == "none":
+            self._active_agent_id   = None
+            self._active_agent_name = None
+            self._save_active_agent()
+            return await utils.answer(message, self.strings["agent_unset"])
+
+        msg = await utils.answer(message, self.strings["loading"])
+        try:
+            info = await self._agent_get(agent_id)
+            self._active_agent_id   = info["id"]
+            self._active_agent_name = info.get("name", agent_id)
+            self._save_active_agent()
+            await utils.answer(
+                msg,
+                self.strings["agent_set"].format(id=info["id"], name=info.get("name", "?")),
+            )
+        except RuntimeError as e:
+            await utils.answer(msg, self.strings["error"].format(error=e))
+
+    @loader.command(ru_doc="<agent_id> — Інфо про Mistral-агента")
+    async def mistralагentinfo(self, message):
+        """<agent_id> — Детальна інформація про агента"""
+        if not self._ok():
+            return await utils.answer(message, self.strings["no_api_key"])
+        agent_id = utils.get_args_raw(message).strip() or self._active_agent_id
+        if not agent_id:
+            return await utils.answer(message, self.strings["no_args"])
+        msg = await utils.answer(message, self.strings["loading"])
+        try:
+            a = await self._agent_get(agent_id)
+            tools = ", ".join(t.get("type", "?") for t in a.get("tools", [])) or "—"
+            await utils.answer(
+                msg,
+                self.strings["agent_info"].format(
+                    id=a["id"], name=a.get("name", "?"),
+                    model=a.get("model", "?"), tools=tools,
+                    instructions=a.get("instructions", "—") or "—",
+                ),
+            )
+        except RuntimeError as e:
+            await utils.answer(msg, self.strings["error"].format(error=e))
+
+    @loader.command(ru_doc="<назва> | <модель> | <інструкція> | [tools] — Створити Mistral-агента")
+    async def mistralcreate(self, message):
+        """
+        Створити нового Mistral-агента.
+        Формат: <назва> | <модель> | <інструкція> | [web_search,image_generation,code_interpreter]
+        Приклад: .mistralcreate MyBot | mistral-large-latest | Ти корисний бот | web_search,image_generation
+        """
+        if not self._ok():
+            return await utils.answer(message, self.strings["no_api_key"])
+        raw = utils.get_args_raw(message).strip()
+        if not raw or "|" not in raw:
+            return await utils.answer(
+                message,
+                "<b>❌ Формат:</b> <code>.mistralcreate Назва | модель | Інструкція | tool1,tool2</code>\n"
+                "<b>Доступні tools:</b> <code>web_search</code>, <code>image_generation</code>, "
+                "<code>code_interpreter</code>, <code>web_search_premium</code>",
+            )
+        parts = [p.strip() for p in raw.split("|")]
+        name         = parts[0] if len(parts) > 0 else "My Agent"
+        model        = parts[1] if len(parts) > 1 else self.config["chat_model"]
+        instructions = parts[2] if len(parts) > 2 else ""
+        tool_names   = [t.strip() for t in parts[3].split(",")] if len(parts) > 3 else []
+
+        TOOL_MAP = {
+            "web_search":         {"type": "web_search"},
+            "image_generation":   {"type": "image_generation"},
+            "code_interpreter":   {"type": "code_interpreter"},
+            "web_search_premium": {"type": "web_search_premium"},
+        }
+        tools = [TOOL_MAP[t] for t in tool_names if t in TOOL_MAP]
+
+        msg = await utils.answer(message, self.strings["loading"])
+        try:
+            agent = await self._agent_create(name, model, instructions, tools)
+            await utils.answer(
+                msg,
+                self.strings["agent_created"].format(id=agent["id"], name=agent.get("name", name)),
+            )
+        except RuntimeError as e:
+            await utils.answer(msg, self.strings["error"].format(error=e))
+
+    @loader.command(ru_doc="<agent_id> — Видалити Mistral-агента")
+    async def mistraldelete(self, message):
+        """<agent_id> — Видалити агента з Mistral Platform"""
+        if not self._ok():
+            return await utils.answer(message, self.strings["no_api_key"])
+        agent_id = utils.get_args_raw(message).strip()
+        if not agent_id:
+            return await utils.answer(message, self.strings["no_args"])
+        msg = await utils.answer(message, self.strings["loading"])
+        try:
+            await self._agent_delete(agent_id)
+            if self._active_agent_id == agent_id:
+                self._active_agent_id   = None
+                self._active_agent_name = None
+                self._save_active_agent()
+            await utils.answer(msg, self.strings["agent_deleted"].format(id=agent_id))
+        except RuntimeError as e:
+            await utils.answer(msg, self.strings["error"].format(error=e))
+
+    # ── Авто-агент (watcher) ────────────────────────────────────────────────
+
+    @loader.command(ru_doc="— Увімкнути/вимкнути авто-агент у поточному чаті")
+    async def mistralauto(self, message):
+        """— Увімкнути/вимкнути авто-агент (ШІ відповідає замість тебе)"""
+        chat_id = message.chat_id
+        if chat_id in self._auto_chats:
+            del self._auto_chats[chat_id]
+            self._save_auto()
+            await utils.answer(message, self.strings["autoagent_off"].format(chat=chat_id))
+        else:
+            self._auto_chats[chat_id] = True
+            self._save_auto()
+            await utils.answer(message, self.strings["autoagent_on"].format(chat=chat_id))
+
+    @loader.command(ru_doc="— Список чатів з активним авто-агентом")
+    async def mistralautolist(self, message):
+        """— Список чатів де активний авто-агент"""
+        if not self._auto_chats:
+            return await utils.answer(message, self.strings["autoagent_list_empty"])
+        lines = [f"• <code>{cid}</code>" for cid in self._auto_chats]
+        await utils.answer(
+            message,
+            self.strings["autoagent_list"].format(chats="\n".join(lines)),
+        )
+
+    @loader.command(ru_doc="— Очистити пам'ять авто-агента у поточному чаті")
+    async def mistralclear(self, message):
+        """— Очистити пам'ять авто-агента"""
+        chat_id = message.chat_id
+        if chat_id in self._memory:
+            del self._memory[chat_id]
+        await utils.answer(message, self.strings["memory_cleared"].format(chat=chat_id))
+
+    # ── Інструменти ────────────────────────────────────────────────────────
+
+    @loader.command(ru_doc="— Список моделей Mistral")
+    async def mistralmodels(self, message):
+        """— Показати всі доступні моделі"""
+        if not self._ok():
+            return await utils.answer(message, self.strings["no_api_key"])
+        msg = await utils.answer(message, self.strings["loading"])
+        try:
+            models = await self._models()
             if not models:
                 return await utils.answer(msg, "<b>❌ Моделі не знайдено.</b>")
             lines = []
             for m in sorted(models, key=lambda x: x.get("id", "")):
-                mid = m.get("id", "?")
                 caps = m.get("capabilities", {})
-                tags = []
-                if caps.get("completion_chat"):
-                    tags.append("💬")
-                if caps.get("vision"):
-                    tags.append("👁")
-                if caps.get("function_calling"):
-                    tags.append("🔧")
-                if caps.get("fine_tuning"):
-                    tags.append("🎯")
-                lines.append(f"• <code>{mid}</code> {' '.join(tags)}")
+                tags = (
+                    ("💬" if caps.get("completion_chat") else "") +
+                    ("👁" if caps.get("vision") else "") +
+                    ("🔧" if caps.get("function_calling") else "") +
+                    ("🎯" if caps.get("fine_tuning") else "")
+                )
+                lines.append(f"• <code>{m.get('id','?')}</code> {tags}")
             text = self.strings["models_header"] + "\n".join(lines)
             if len(text) > 4096:
                 text = text[:4090] + "\n..."
@@ -631,25 +865,23 @@ class MistralModule(loader.Module):
 
     @loader.command(ru_doc="— OCR зображення або PDF (відповідь на медіа)")
     async def mistralocr(self, message):
-        """— OCR зображення/PDF. Відповідь на фото або файл."""
-        if not self._check_key():
+        """— OCR зображення/PDF"""
+        if not self._ok():
             return await utils.answer(message, self.strings["no_api_key"])
         reply = await message.get_reply_message()
         msg = await utils.answer(message, self.strings["loading"])
         try:
             if reply and reply.photo:
-                photo_bytes = await reply.download_media(bytes)
-                result = await self._ocr_base64(photo_bytes, "image/jpeg")
+                result = await self._ocr_b64(await reply.download_media(bytes), "image/jpeg")
             elif reply and reply.document:
                 mime = reply.document.mime_type or ""
-                doc_bytes = await reply.download_media(bytes)
-                mt = "application/pdf" if "pdf" in mime else "image/jpeg"
-                result = await self._ocr_base64(doc_bytes, mt)
+                result = await self._ocr_b64(
+                    await reply.download_media(bytes),
+                    "application/pdf" if "pdf" in mime else "image/jpeg",
+                )
             else:
                 return await utils.answer(msg, self.strings["ocr_no_media"])
-            if not result:
-                result = "<i>(текст не знайдено)</i>"
-            output = self.strings["ocr_result"].format(text=result)
+            output = self.strings["ocr_result"].format(text=result or "<i>(текст не знайдено)</i>")
             if len(output) > 4096:
                 output = output[:4090] + "\n..."
             await utils.answer(msg, output)
@@ -658,56 +890,47 @@ class MistralModule(loader.Module):
 
     @loader.command(ru_doc="<текст> — Синтез мовлення (TTS)")
     async def mistralvoice(self, message):
-        """<текст> — Перетворити текст на голос (TTS)"""
-        if not self._check_key():
+        """<текст> — TTS"""
+        if not self._ok():
             return await utils.answer(message, self.strings["no_api_key"])
         args = utils.get_args_raw(message).strip()
         if not args:
             return await utils.answer(message, self.strings["no_args"])
         msg = await utils.answer(message, self.strings["tts_generating"])
         try:
-            wav_bytes = await self._tts(args)
+            wav = await self._tts(args)
             await message.client.send_file(
-                message.peer_id,
-                file=io.BytesIO(wav_bytes),
-                attributes=[],
-                voice_note=True,
-                caption=self.strings["tts_done"],
+                message.peer_id, io.BytesIO(wav),
+                voice_note=True, caption=self.strings["tts_done"],
                 reply_to=message.reply_to_msg_id,
             )
             await msg.delete()
         except RuntimeError as e:
             await utils.answer(msg, self.strings["error"].format(error=e))
 
-    @loader.command(ru_doc="— Транскрипція аудіо/голосу (відповідь на аудіо)")
+    @loader.command(ru_doc="— Транскрипція аудіо (відповідь на аудіо)")
     async def mistraltranscribe(self, message):
-        """— Транскрибувати голосове або аудіо повідомлення"""
-        if not self._check_key():
+        """— Транскрипція голосового/аудіо"""
+        if not self._ok():
             return await utils.answer(message, self.strings["no_api_key"])
         reply = await message.get_reply_message()
         if not reply or not (reply.voice or reply.audio or reply.document):
-            return await utils.answer(message, self.strings["transcription_no_audio"])
+            return await utils.answer(message, self.strings["no_audio"])
         msg = await utils.answer(message, self.strings["loading"])
         try:
-            audio_bytes = await reply.download_media(bytes)
-            fname = "audio.ogg"
-            if reply.audio:
-                fname = "audio.mp3"
-            elif reply.document and reply.document.attributes:
-                fname = getattr(reply.document.attributes[0], "file_name", "audio.ogg")
-            text = await self._transcribe(audio_bytes, fname)
-            if not text:
-                text = "<i>(текст не розпізнано)</i>"
+            audio = await reply.download_media(bytes)
+            fname = "audio.mp3" if reply.audio else "audio.ogg"
+            text = await self._transcribe(audio, fname)
             await utils.answer(
-                msg, self.strings["transcription_result"].format(text=text)
+                msg, self.strings["transcription"].format(text=text or "<i>(не розпізнано)</i>")
             )
         except RuntimeError as e:
             await utils.answer(msg, self.strings["error"].format(error=e))
 
-    @loader.command(ru_doc="<текст> — Отримати ембединг тексту")
+    @loader.command(ru_doc="<текст> — Ембединг тексту")
     async def mistralembed(self, message):
-        """<текст> — Отримати векторне представлення тексту"""
-        if not self._check_key():
+        """<текст> — Векторне представлення"""
+        if not self._ok():
             return await utils.answer(message, self.strings["no_api_key"])
         args = utils.get_args_raw(message).strip()
         if not args:
@@ -715,20 +938,19 @@ class MistralModule(loader.Module):
         msg = await utils.answer(message, self.strings["loading"])
         try:
             vec, model = await self._embeddings(args)
-            preview = ", ".join(f"{v:.4f}" for v in vec[:5])
             await utils.answer(
-                msg,
-                self.strings["embed_result"].format(
-                    model=model, dim=len(vec), preview=preview
+                msg, self.strings["embed_result"].format(
+                    model=model, dim=len(vec),
+                    preview=", ".join(f"{v:.4f}" for v in vec[:5]),
                 ),
             )
         except RuntimeError as e:
             await utils.answer(msg, self.strings["error"].format(error=e))
 
-    @loader.command(ru_doc="<текст> — Перевірити текст на порушення правил")
+    @loader.command(ru_doc="<текст> — Модерація тексту")
     async def mistralmod(self, message):
-        """<текст> — Модерація тексту"""
-        if not self._check_key():
+        """<текст> — Перевірити текст"""
+        if not self._ok():
             return await utils.answer(message, self.strings["no_api_key"])
         args = utils.get_args_raw(message).strip()
         if not args:
@@ -736,16 +958,13 @@ class MistralModule(loader.Module):
         msg = await utils.answer(message, self.strings["loading"])
         try:
             data = await self._moderate(args)
-            results = data.get("results", [{}])[0]
-            flagged = results.get("flagged", False)
-            cats = results.get("categories", {})
-            active = [k for k, v in cats.items() if v]
-            safe_str = "✅ Так" if not flagged else "🚫 Ні (порушення)"
-            cats_str = ", ".join(active) if active else "немає"
+            res = data.get("results", [{}])[0]
+            flagged = res.get("flagged", False)
+            active  = [k for k, v in res.get("categories", {}).items() if v]
             await utils.answer(
-                msg,
-                self.strings["moderation_result"].format(
-                    safe=safe_str, categories=cats_str
+                msg, self.strings["moderation"].format(
+                    safe="✅ Так" if not flagged else "🚫 Ні",
+                    cats=", ".join(active) or "немає",
                 ),
             )
         except RuntimeError as e:
@@ -753,25 +972,39 @@ class MistralModule(loader.Module):
 
     # ── Довідка ────────────────────────────────────────────────────────────
 
-    @loader.command(ru_doc="— Показати допомогу по модулю")
+    @loader.command(ru_doc="— Список команд")
     async def mistralhelp(self, message):
-        """— Список команд модуля MistralAI"""
+        """— Список усіх команд MistralAI"""
+        active = (
+            f"\n<b>🤖 Активний агент:</b> <code>{self._active_agent_id}</code> "
+            f"(<b>{self._active_agent_name}</b>)"
+            if self._active_agent_id else ""
+        )
         await utils.answer(
             message,
-            "<b>🤖 MistralAI v2 — команди:</b>\n\n"
+            f"<b>🤖 MistralAI v3 — команди:</b>{active}\n\n"
             "<b>💬 Чат</b>\n"
-            "<code>.mistral &lt;питання&gt;</code> — Чат з Mistral\n"
+            "<code>.mistral &lt;питання&gt;</code> — Чат (або через активного агента)\n"
             "<code>.mistralm &lt;модель&gt; &lt;питання&gt;</code> — Конкретна модель\n"
             "<code>.mistralmodels</code> — Список моделей\n\n"
-            "<b>🤖 Агент-режим</b>\n"
-            "<code>.mistralagent</code> — Увімкнути/вимкнути у поточному чаті\n"
-            "<code>.mistralagentlist</code> — Список активних агент-чатів\n"
-            "<code>.mistralagentclear</code> — Очистити пам'ять агента\n\n"
+            "<b>🎨 Зображення</b>\n"
+            "<code>.mistralimg &lt;промт&gt;</code> — Генерація зображення\n\n"
+            "<b>🤖 Mistral Platform Agents</b>\n"
+            "<code>.mistralagents</code> — Список твоїх агентів\n"
+            "<code>.mistraluse &lt;agent_id&gt;</code> — Вибрати активного агента\n"
+            "<code>.mistraluse none</code> — Скинути агента\n"
+            "<code>.mistralагentinfo [agent_id]</code> — Інфо про агента\n"
+            "<code>.mistralcreate Назва | модель | Інструкція | tools</code> — Створити агента\n"
+            "<code>.mistraldelete &lt;agent_id&gt;</code> — Видалити агента\n\n"
+            "<b>👻 Авто-агент (відповідає замість тебе)</b>\n"
+            "<code>.mistralauto</code> — Увімк/вимк у поточному чаті\n"
+            "<code>.mistralautolist</code> — Список активних чатів\n"
+            "<code>.mistralclear</code> — Очистити пам'ять\n\n"
             "<b>🛠 Інструменти</b>\n"
-            "<code>.mistralocr</code> — OCR фото або PDF\n"
-            "<code>.mistralvoice &lt;текст&gt;</code> — TTS синтез мовлення\n"
+            "<code>.mistralocr</code> — OCR фото/PDF\n"
+            "<code>.mistralvoice &lt;текст&gt;</code> — TTS\n"
             "<code>.mistraltranscribe</code> — Транскрипція аудіо\n"
-            "<code>.mistralembed &lt;текст&gt;</code> — Ембединг тексту\n"
-            "<code>.mistralmod &lt;текст&gt;</code> — Модерація тексту\n\n"
-            "<i>⚙️ Налаштування: <code>.config MistralAI</code></i>",
+            "<code>.mistralembed &lt;текст&gt;</code> — Ембединг\n"
+            "<code>.mistralmod &lt;текст&gt;</code> — Модерація\n\n"
+            "<i>⚙️ <code>.config MistralAI</code></i>",
         )
