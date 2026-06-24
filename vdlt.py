@@ -1,4 +1,4 @@
-__version__ = (5, 3, 1)
+__version__ = (5, 4, 0)
 
 import os
 import re
@@ -333,7 +333,7 @@ class VideoDownloaderMod(loader.Module):
         "caption_playlist":   "<b>📋 {title} ({idx}/{total})</b>",
         "transcript_header":  "<b>📝 Транскрипт: {title}</b>\n\n",
         "help_text": (
-            "<b>🎬 VideoDownloader v5.3.1</b>\n\n"
+            "<b>🎬 VideoDownloader v5.4.0</b>\n\n"
             "<b>Основні команди:</b>\n"
             "• <code>.vdl</code> — увімк/вимк авто-завантаження\n"
             "• <code>.vdldl [URL]</code> — ручне завантаження\n"
@@ -351,7 +351,7 @@ class VideoDownloaderMod(loader.Module):
             "<b>.vdlset [параметр] [значення]:</b>\n"
             "cooldown, limit, size, auto_delete,\n"
             "retries, queue_max, notify_dm,\n"
-            "playlist, playlist_max, audio_format"
+            "playlist, playlist_max, audio_format, workers"
         ),
     }
 
@@ -369,6 +369,7 @@ class VideoDownloaderMod(loader.Module):
             loader.ConfigValue("auto_delete",      0,     "Авто-видалення (сек, 0=вимкнено)"),
             loader.ConfigValue("retries",          3,     "Спроб зі зниженням якості"),
             loader.ConfigValue("queue_max",        5,     "Макс. черга"),
+            loader.ConfigValue("queue_workers",    2,     "Паралельних завантажень (1-4)"),
             loader.ConfigValue("notify_dm",        False, "Сповіщення в ЛС?"),
             loader.ConfigValue("fix_orientation",  True,  "Авто-виправлення орієнтації відео?"),
             loader.ConfigValue("playlist_enabled", False, "Дозволити плейлисти?"),
@@ -393,6 +394,7 @@ class VideoDownloaderMod(loader.Module):
         self._last_dl: float = 0.0
         self._queue: asyncio.Queue | None = None
         self._worker_task = None
+        self._worker_tasks: list[asyncio.Task] = []
         self._client = None
         self._js_runtime: str | None = _js_runtime_arg()
         if self._js_runtime:
@@ -406,19 +408,40 @@ class VideoDownloaderMod(loader.Module):
         self._client = client
         _merge_platform_cookies()
         self._queue = asyncio.Queue(maxsize=self.config["queue_max"])
-        self._worker_task = asyncio.ensure_future(self._queue_worker())
+        self._start_queue_workers()
         if self.config.get("auto_install_deps", True):
             asyncio.ensure_future(self._ensure_runtime_dependencies())
         elif self.config.get("auto_update_ytdlp", True):
             asyncio.ensure_future(self._auto_update_ytdlp())
 
     async def on_unload(self):
-        if self._worker_task:
-            self._worker_task.cancel()
+        for task in self._worker_tasks:
+            task.cancel()
+        for task in self._worker_tasks:
             try:
-                await self._worker_task
+                await task
             except asyncio.CancelledError:
                 pass
+        self._worker_tasks = []
+        self._worker_task = None
+
+
+    def _queue_workers_count(self) -> int:
+        try:
+            return max(1, min(4, int(self.config.get("queue_workers", 2))))
+        except Exception:
+            return 2
+
+    def _start_queue_workers(self):
+        # Кілька воркерів прибирають головний bottleneck: короткі відео більше не чекають,
+        # доки попереднє завдання повністю завантажиться та відправиться.
+        for task in self._worker_tasks:
+            task.cancel()
+        self._worker_tasks = [
+            asyncio.ensure_future(self._queue_worker())
+            for _ in range(self._queue_workers_count())
+        ]
+        self._worker_task = self._worker_tasks[0] if self._worker_tasks else None
 
     async def _queue_worker(self):
         while True:
@@ -526,27 +549,39 @@ class VideoDownloaderMod(loader.Module):
         quality = "0" if fmt == "flac" else "192"
         return [{"key": "FFmpegExtractAudio", "preferredcodec": fmt, "preferredquality": quality}]
 
+    def _fast_ytdlp_opts(self) -> dict:
+        return {
+            "concurrent_fragment_downloads": 8,
+            "buffersize": 4 * 1024 * 1024,
+            "http_chunk_size": 10 * 1024 * 1024,
+            "socket_timeout": 20,
+            "retries": 5,
+            "fragment_retries": 5,
+            "file_access_retries": 3,
+        }
+
     def _format_chain(self, quality: str, vertical: bool = False) -> list[str]:
         q = quality.lower().replace("p", "")
         if vertical:
             h = {"360": 640, "480": 854, "720": 1280, "1080": 1920}.get(q, 1280)
             return [
+                f"best[height<={h}][ext=mp4]",
                 f"bestvideo[ext=mp4][height<={h}]+bestaudio[ext=m4a]",
                 f"bestvideo[height<={h}]+bestaudio",
-                f"best[height<={h}][ext=mp4]",
                 f"best[height<={h}]",
                 "best[ext=mp4]", "best", "worst",
             ]
         h = {"360": 360, "480": 480, "720": 720, "1080": 1080}.get(q, 720)
         if q == "best":
             return [
+                "best[ext=mp4]",
                 "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo[ext=mp4]+bestaudio",
-                "bestvideo+bestaudio", "best[ext=mp4]", "best", "worst",
+                "bestvideo+bestaudio", "best", "worst",
             ]
         return [
+            f"best[height<={h}][ext=mp4]",
             f"bestvideo[ext=mp4][height<={h}]+bestaudio[ext=m4a]",
             f"bestvideo[height<={h}]+bestaudio",
-            f"best[height<={h}][ext=mp4]",
             f"best[height<={h}]",
             "best[ext=mp4]", "best", "worst",
         ]
@@ -558,18 +593,19 @@ class VideoDownloaderMod(loader.Module):
             h = {"360": 640, "480": 854, "720": 1280, "1080": 1920}.get(q, 1280)
         if q == "best" or h >= 1080:
             return [
+                "best[ext=mp4]",
                 "bestvideo[protocol=m3u8_native][ext=mp4]+bestaudio[ext=m4a]",
                 "bestvideo[protocol=m3u8_native]+bestaudio",
                 "bestvideo[ext=mp4]+bestaudio[ext=m4a]",
                 "bestvideo+bestaudio",
-                "best[ext=mp4]", "best", "worst",
+                "best", "worst",
             ]
         return [
+            f"best[height<={h}][ext=mp4]",
             f"bestvideo[protocol=m3u8_native][ext=mp4][height<={h}]+bestaudio[ext=m4a]",
             f"bestvideo[protocol=m3u8_native][height<={h}]+bestaudio",
             f"bestvideo[ext=mp4][height<={h}]+bestaudio[ext=m4a]",
             f"bestvideo[height<={h}]+bestaudio",
-            f"best[height<={h}][ext=mp4]",
             f"best[height<={h}]",
             "best[ext=mp4]", "best", "worst",
         ]
@@ -726,7 +762,7 @@ class VideoDownloaderMod(loader.Module):
                     return None
                 p = f"{base_name}_direct.{ext}"
                 with open(p, "wb") as f:
-                    for chunk in resp.iter_content(65536):
+                    for chunk in resp.iter_content(1024 * 1024):
                         if chunk:
                             f.write(chunk)
                 return p if os.path.getsize(p) > 0 else None
@@ -852,6 +888,7 @@ class VideoDownloaderMod(loader.Module):
                     "ignoreerrors": True,
                     "postprocessors": postprocessors,
                 }
+                opts.update(self._fast_ytdlp_opts())
                 if cookies:
                     opts["cookiefile"] = cookies
                 try:
@@ -1081,6 +1118,7 @@ class VideoDownloaderMod(loader.Module):
                              "-reconnect_delay_max", "5"],
             },
         }
+        opts.update(self._fast_ytdlp_opts())
         if cookies:
             opts["cookiefile"] = cookies
 
@@ -1192,6 +1230,7 @@ class VideoDownloaderMod(loader.Module):
             "postprocessors": self._audio_postprocessor() if audio else [],
             "progress_hooks": [self._progress_hook(status_msg, loop)] if status_msg else [],
         }
+        opts.update(self._fast_ytdlp_opts())
         if cookies:
             opts["cookiefile"] = cookies
 
@@ -1536,6 +1575,7 @@ class VideoDownloaderMod(loader.Module):
             reply_to=message.id, caption=caption,
             parse_mode="html",
             force_document=force_document,
+            part_size_kb=512,
         )
         ad = self.config["auto_delete"]
         if ad > 0:
@@ -1592,6 +1632,7 @@ class VideoDownloaderMod(loader.Module):
                             caption=chunk_caption,
                             parse_mode="html",
                             force_document=(ftype == "other"),
+                            part_size_kb=512,
                         )
                     except Exception as e:
                         logger.warning("Single file send failed: %s", e)
@@ -1606,6 +1647,7 @@ class VideoDownloaderMod(loader.Module):
                         reply_to=message.id,
                         caption=captions_list,
                         parse_mode="html",
+                        part_size_kb=512,
                     )
                 except Exception as e:
                     logger.warning("Album send failed, trying individually: %s", e)
@@ -1620,6 +1662,7 @@ class VideoDownloaderMod(loader.Module):
                                 caption=fb_caption,
                                 parse_mode="html",
                                 force_document=(ftype == "other"),
+                                part_size_kb=512,
                             )
                         except Exception as e2:
                             logger.warning("Single file send failed: %s", e2)
@@ -1982,6 +2025,7 @@ class VideoDownloaderMod(loader.Module):
                 message,
                 "<b>Параметри:</b>\ncooldown, limit, size, auto_delete,\n"
                 "retries, queue_max, notify_dm,\n"
+                "workers (1-4 паралельних завантажень),\n"
                 "fix_orientation, playlist, playlist_max,\n"
                 "audio_format (mp3/m4a/wav/opus/flac),\n"
                 "timeout (сек, таймаут завдання)"
@@ -1994,6 +2038,7 @@ class VideoDownloaderMod(loader.Module):
             "auto_delete":     ("auto_delete",       int,  "сек"),
             "retries":         ("retries",           int,  "спроб"),
             "queue_max":       ("queue_max",         int,  "завдань"),
+            "workers":         ("queue_workers",     int,  "воркерів"),
             "notify_dm":       ("notify_dm",         bool, ""),
             "fix_orientation": ("fix_orientation",   bool, ""),
             "playlist":        ("playlist_enabled",  bool, ""),
@@ -2018,8 +2063,13 @@ class VideoDownloaderMod(loader.Module):
         except ValueError:
             return await utils.answer(message, "<b>❌ Значення має бути числом.</b>")
         self.config[cfg_key] = val
+        if key == "workers":
+            self.config[cfg_key] = max(1, min(4, val))
+            self._start_queue_workers()
+            val = self.config[cfg_key]
         if key == "queue_max" and self._queue is not None:
             self._queue = asyncio.Queue(maxsize=val)
+            self._start_queue_workers()
         if cast is bool:
             await utils.answer(message, f"<b>{key}: {'✅ ON' if val else '❌ OFF'}</b>")
         else:
@@ -2075,6 +2125,7 @@ class VideoDownloaderMod(loader.Module):
         await utils.answer(
             message,
             f"<b>📋 Черга: <code>{self._queue.qsize()}</code> / <code>{self.config['queue_max']}</code></b>"
+            f"\n<b>⚡ Воркери: <code>{self._queue_workers_count()}</code></b>"
         )
 
     @loader.command()
