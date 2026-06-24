@@ -1,4 +1,4 @@
-__version__ = (5, 2, 0)
+__version__ = (5, 3, 1)
 
 import os
 import re
@@ -6,6 +6,8 @@ import glob
 import time
 import shutil
 import logging
+import subprocess
+import sys
 import asyncio
 import mimetypes
 import unicodedata
@@ -20,17 +22,36 @@ COOKIES_DIR     = "/home/rkbot/URKbot/"
 COOKIES_DEFAULT = os.path.join(COOKIES_DIR, "cookies.txt")
 COOKIES_YOUTUBE = os.path.join(COOKIES_DIR, "cookies-youtube-com.txt")
 
+PIP_DEPENDENCIES = {
+    "yt-dlp": "yt_dlp",
+    "gallery-dl": "gallery_dl",
+    "instaloader": "instaloader",
+    "requests": "requests",
+}
+
 SUPPORTED_HOSTS = [
-    "tiktok.com", "youtu.be", "youtube.com",
-    "instagram.com/", "instagr.am/",
-    "x.com/", "twitter.com/",
+    "tiktok.com", "vm.tiktok.com", "vt.tiktok.com",
+    "youtu.be", "youtube.com", "music.youtube.com",
+    "instagram.com/", "instagr.am/", "threads.net/",
+    "x.com/", "twitter.com/", "t.co/",
     "pinterest.com/", "pin.it/",
     "vimeo.com/", "reddit.com/", "redd.it/",
     "twitch.tv/", "dailymotion.com/",
-    "bilibili.com/", "b23.tv/",
+    "bilibili.com/", "b23.tv/", "facebook.com/", "fb.watch/",
+    "soundcloud.com/", "snapchat.com/", "likee.video/", "kwai.com/",
 ]
 
+COOKIE_DOMAINS = {
+    "YouTube": ("youtube.com", "youtu.be", "googlevideo.com"),
+    "Instagram": ("instagram.com", "instagr.am", "threads.net"),
+    "TikTok": ("tiktok.com", "tiktokv.com", "muscdn.com"),
+    "X/Twitter": ("twitter.com", "x.com", "twimg.com"),
+    "Reddit": ("reddit.com", "redd.it"),
+    "Pinterest": ("pinterest.com", "pinimg.com"),
+}
+
 PLATFORM_COOKIES = {
+    # Legacy path: auto-merged into cookies.txt and used only as a last resort.
     "youtube.com": COOKIES_YOUTUBE,
     "youtu.be":    COOKIES_YOUTUBE,
 }
@@ -69,16 +90,61 @@ def _ig_shortcode(url: str) -> str | None:
     return m.group(1) if m else None
 
 
+def _cookie_file_has_domain(path: str, domains: tuple[str, ...]) -> bool:
+    if not os.path.isfile(path) or os.path.getsize(path) <= 0:
+        return False
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                if not line or line.startswith("#") and not line.startswith("#HttpOnly_"):
+                    continue
+                low = line.lower()
+                if any(d in low for d in domains):
+                    return True
+    except Exception as e:
+        logger.warning("Could not read cookies file %s: %s", path, e)
+    return False
+
+
+def _cookie_domains_status(path: str = COOKIES_DEFAULT) -> dict[str, bool]:
+    return {name: _cookie_file_has_domain(path, domains) for name, domains in COOKIE_DOMAINS.items()}
+
+
+def _merge_platform_cookies() -> bool:
+    """Move legacy per-platform cookies into the main cookies.txt file."""
+    changed = False
+    os.makedirs(COOKIES_DIR, exist_ok=True)
+    for host, path in PLATFORM_COOKIES.items():
+        if not os.path.isfile(path) or os.path.getsize(path) <= 0:
+            continue
+        domains = (host,)
+        if _cookie_file_has_domain(COOKIES_DEFAULT, domains):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as src, \
+                 open(COOKIES_DEFAULT, "a", encoding="utf-8") as dst:
+                if os.path.getsize(COOKIES_DEFAULT) == 0:
+                    dst.write("# Netscape HTTP Cookie File\n")
+                dst.write(f"\n# Imported from {os.path.basename(path)} by VideoDownloader\n")
+                dst.write(src.read().rstrip() + "\n")
+            changed = True
+            logger.info("Merged legacy cookies for %s into %s", host, COOKIES_DEFAULT)
+        except Exception as e:
+            logger.warning("Could not merge cookies %s -> %s: %s", path, COOKIES_DEFAULT, e)
+    return changed
+
+
 def _get_cookies(url: str) -> str | None:
     hostname = (urlsplit(url).netloc or "").lower().lstrip("www.")
-    for host, path in PLATFORM_COOKIES.items():
-        if host in hostname:
-            if os.path.isfile(path) and os.path.getsize(path) > 0:
-                return path
-            logger.warning("Platform cookies missing: %s", path)
-            break
     if os.path.isfile(COOKIES_DEFAULT) and os.path.getsize(COOKIES_DEFAULT) > 0:
+        matched = [domains for domains in COOKIE_DOMAINS.values() if any(d in hostname for d in domains)]
+        if not matched or _cookie_file_has_domain(COOKIES_DEFAULT, matched[0]):
+            return COOKIES_DEFAULT
+        logger.info("cookies.txt exists but has no cookies for %s; using shared file anyway", hostname)
         return COOKIES_DEFAULT
+    for host, path in PLATFORM_COOKIES.items():
+        if host in hostname and os.path.isfile(path) and os.path.getsize(path) > 0:
+            return path
     return None
 
 
@@ -104,6 +170,8 @@ def _cleanup(base_name: str):
         try:
             if os.path.isfile(p):
                 os.remove(p)
+            elif os.path.isdir(p) and p.endswith(("_gallery", "_ig")):
+                shutil.rmtree(p, ignore_errors=True)
         except Exception:
             pass
 
@@ -233,6 +301,8 @@ class VideoDownloaderMod(loader.Module):
         "dl_no_url":          "<b>❌ Вкажи URL або відповідай на повідомлення з посиланням.</b>",
         "cookies_refreshed":  "<b>✅ Cookies оновлено ({} байт).</b>",
         "cookies_refresh_err":"<b>❌ Помилка оновлення cookies: {}</b>",
+        "update_ok":          "<b>✅ yt-dlp оновлено до останньої версії.</b>",
+        "update_err":         "<b>❌ Не вдалося оновити yt-dlp: {}</b>",
         "stats": (
             "<b>📊 Статистика:</b>\n"
             "├ Всього: <code>{total}</code>\n"
@@ -249,9 +319,10 @@ class VideoDownloaderMod(loader.Module):
         ),
         "stats_reset":    "<b>🗑 Статистику скинуто.</b>",
         "cookies_status": (
-            "<b>🍪 Cookies:</b>\n"
-            "├ YouTube: {yt}\n"
-            "└ Загальний: {default}"
+            "<b>🍪 Cookies:</b> <code>cookies.txt</code>\n"
+            "├ Файл: {default}\n"
+            "├ Legacy YouTube: {yt}\n"
+            "└ Домени в cookies.txt:\n{domains}"
         ),
         "js_runtime_status":  "<b>🟢 JS Runtime: <code>{rt}</code></b>",
         "js_runtime_missing": "<b>🔴 JS Runtime: не знайдено (YouTube може не працювати!)</b>",
@@ -262,13 +333,14 @@ class VideoDownloaderMod(loader.Module):
         "caption_playlist":   "<b>📋 {title} ({idx}/{total})</b>",
         "transcript_header":  "<b>📝 Транскрипт: {title}</b>\n\n",
         "help_text": (
-            "<b>🎬 VideoDownloader v5.2.0</b>\n\n"
+            "<b>🎬 VideoDownloader v5.3.1</b>\n\n"
             "<b>Основні команди:</b>\n"
             "• <code>.vdl</code> — увімк/вимк авто-завантаження\n"
             "• <code>.vdldl [URL]</code> — ручне завантаження\n"
             "• <code>.vdlaudio</code> — перемкнути MP3/відео\n"
             "• <code>.vdlq [360/480/720/1080/best]</code> — якість\n"
             "• <code>.vdlcookies</code> — статус cookies\n"
+            "• <code>.vdlupdate</code> — оновити yt-dlp\n"
             "• <code>.vdlqueue</code> — черга\n"
             "• <code>.vdlruntime</code> — статус JS runtime\n\n"
             "<b>Транскрипт:</b>\n"
@@ -283,7 +355,7 @@ class VideoDownloaderMod(loader.Module):
         ),
     }
 
-    requires = ["yt-dlp", "requests", "instaloader"]
+    requires = ["yt-dlp", "requests", "instaloader", "gallery-dl"]
 
     def __init__(self):
         self.config = loader.ModuleConfig(
@@ -307,6 +379,9 @@ class VideoDownloaderMod(loader.Module):
             loader.ConfigValue("ig_password",      "",    "Instagram пароль"),
             loader.ConfigValue("transcript_lang",  "uk",  "Мова транскрипту"),
             loader.ConfigValue("task_timeout",     600,   "Таймаут завдання (сек)"),
+            loader.ConfigValue("auto_update_ytdlp", True, "Автоматично оновлювати yt-dlp раз на добу"),
+            loader.ConfigValue("auto_install_deps", True, "Автоматично ставити відсутні бібліотеки"),
+            loader.ConfigValue("use_gallery_dl",    True, "Fallback через gallery-dl для Reddit/Pinterest/X/Instagram тощо"),
         )
         self._stats = {
             "total": 0, "ok": 0, "err": 0, "retried": 0,
@@ -329,8 +404,13 @@ class VideoDownloaderMod(loader.Module):
 
     async def client_ready(self, client, db):
         self._client = client
+        _merge_platform_cookies()
         self._queue = asyncio.Queue(maxsize=self.config["queue_max"])
         self._worker_task = asyncio.ensure_future(self._queue_worker())
+        if self.config.get("auto_install_deps", True):
+            asyncio.ensure_future(self._ensure_runtime_dependencies())
+        elif self.config.get("auto_update_ytdlp", True):
+            asyncio.ensure_future(self._auto_update_ytdlp())
 
     async def on_unload(self):
         if self._worker_task:
@@ -920,6 +1000,8 @@ class VideoDownloaderMod(loader.Module):
                                       self.config["quality"], True)
             if r:
                 result = [r] if isinstance(r, str) else [r]
+        if result is None and not audio:
+            result = await self._dl_gallery_dl(url, base_name)
         return result
 
     # ── Twitter/X ─────────────────────────────────────────────────────────────
@@ -1075,6 +1157,19 @@ class VideoDownloaderMod(loader.Module):
             if result:
                 return result
 
+        if self.config.get("auto_update_ytdlp", True):
+            ok, _ = await self._auto_update_ytdlp(force=True)
+            if ok:
+                for fmt in fmt_chain[-2:]:
+                    result = await utils.run_sync(
+                        self._try_ydl_format,
+                        url, f"{base_name}_updated", fmt, audio, cookies, status_msg, loop, False
+                    )
+                    if result == "TOO_LARGE":
+                        return "TOO_LARGE"
+                    if result:
+                        return result
+
         return None
 
     # ── yt-dlp загальний ──────────────────────────────────────────────────────
@@ -1160,7 +1255,123 @@ class VideoDownloaderMod(loader.Module):
                 return "TOO_LARGE"
             if result:
                 return result
+        if self.config.get("auto_update_ytdlp", True):
+            ok, _ = await self._auto_update_ytdlp(force=True)
+            if ok:
+                for fmt in chain[-2:]:
+                    result = await utils.run_sync(
+                        self._try_ydl_format,
+                        url, f"{base_name}_updated", fmt, audio, cookies, status_msg, loop, vertical
+                    )
+                    if result == "TOO_LARGE":
+                        return "TOO_LARGE"
+                    if result:
+                        return result
+
         return None
+
+
+    def _pip_install_sync(self, packages: list[str], upgrade: bool = False) -> tuple[bool, str]:
+        if not packages:
+            return True, "nothing to install"
+        os.makedirs(COOKIES_DIR, exist_ok=True)
+        cmd = [sys.executable, "-m", "pip", "install"]
+        if upgrade:
+            cmd.append("-U")
+        cmd.extend(packages)
+        p = subprocess.run(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, timeout=240
+        )
+        return p.returncode == 0, p.stdout[-1500:]
+
+    async def _ensure_runtime_dependencies(self) -> tuple[bool, str]:
+        def _missing_packages():
+            missing = []
+            for package, module in PIP_DEPENDENCIES.items():
+                try:
+                    __import__(module)
+                except Exception:
+                    missing.append(package)
+            return missing
+
+        missing = await utils.run_sync(_missing_packages)
+        ok, info = True, "all present"
+        if missing:
+            ok, info = await utils.run_sync(self._pip_install_sync, missing, False)
+            if not ok:
+                logger.warning("Dependency install failed for %s: %s", missing, info)
+                return ok, info
+        if self.config.get("auto_update_ytdlp", True):
+            return await self._auto_update_ytdlp()
+        return ok, info
+
+    async def _auto_update_ytdlp(self, force: bool = False) -> tuple[bool, str]:
+        stamp = os.path.join(COOKIES_DIR, ".yt_dlp_update_stamp")
+        if not force and os.path.isfile(stamp) and time.time() - os.path.getmtime(stamp) < 86400:
+            return True, "recent"
+
+        try:
+            ok, info = await utils.run_sync(self._pip_install_sync, ["yt-dlp"], True)
+            if ok:
+                with open(stamp, "w", encoding="utf-8") as f:
+                    f.write(str(time.time()))
+                return True, info
+            return False, info
+        except Exception as e:
+            logger.warning("yt-dlp update failed: %s", e)
+            return False, str(e)
+
+    async def _dl_gallery_dl(self, url: str, base_name: str) -> list | None:
+        if not self.config.get("use_gallery_dl", True):
+            return None
+        cookies = _get_cookies(url)
+
+        def _run():
+            try:
+                __import__("gallery_dl")
+            except Exception:
+                if not self.config.get("auto_install_deps", True):
+                    return None
+                ok, _ = self._pip_install_sync(["gallery-dl"], False)
+                if not ok:
+                    return None
+
+            out_dir = base_name + "_gallery"
+            os.makedirs(out_dir, exist_ok=True)
+            args = [
+                sys.executable, "-m", "gallery_dl",
+                "-D", out_dir,
+                "-f", "{category}_{id}_{num}.{extension}",
+                "--no-mtime",
+            ]
+            if cookies:
+                args += ["--cookies", cookies]
+            args.append(url)
+
+            try:
+                proc = subprocess.run(
+                    args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, timeout=240
+                )
+                if proc.returncode != 0:
+                    logger.warning("gallery-dl failed: %s", proc.stdout[-500:])
+                    return None
+            except Exception as e:
+                logger.warning("gallery-dl failed: %s", e)
+                return None
+
+            files = []
+            allowed_exts = VIDEO_EXTS | AUDIO_EXTS | IMAGE_EXTS
+            for root, _, names in os.walk(out_dir):
+                for name in names:
+                    path = os.path.join(root, name)
+                    ext = os.path.splitext(path)[1].lower()
+                    if os.path.isfile(path) and os.path.getsize(path) > 0 and ext in allowed_exts:
+                        files.append(path)
+            return sorted(files) or None
+
+        return await utils.run_sync(_run)
 
     # ── download dispatcher ───────────────────────────────────────────────────
 
@@ -1177,16 +1388,26 @@ class VideoDownloaderMod(loader.Module):
             if result:
                 return result
 
-        if "instagram.com" in u or "instagr.am" in u:
+        if "instagram.com" in u or "instagr.am" in u or "threads.net" in u:
             result = await self._dl_instagram_instaloader(url, base_name, audio)
             if result:
                 return result
-            return await self._dl_instagram_ytdlp(url, base_name, audio)
+            result = await self._dl_instagram_ytdlp(url, base_name, audio)
+            if result:
+                return result
+            if not audio:
+                return await self._dl_gallery_dl(url, base_name)
+            return None
 
         if ("x.com" in u or "twitter.com" in u) and not audio:
             photo_result = await self._dl_twitter_photos(url, base_name)
             if photo_result:
                 return photo_result
+
+        if any(h in u for h in ("reddit.com", "redd.it", "vimeo.com", "dailymotion.com", "twitch.tv", "facebook.com", "fb.watch", "soundcloud.com")):
+            gallery_result = await self._dl_gallery_dl(url, base_name)
+            if gallery_result:
+                return gallery_result
 
         if "youtube.com" in u or "youtu.be" in u:
             steps = self._quality_steps() if not audio else ["best"]
@@ -1240,6 +1461,10 @@ class VideoDownloaderMod(loader.Module):
                 return "TOO_LARGE"
             if result:
                 return [result]
+
+        gallery_result = await self._dl_gallery_dl(url, base_name)
+        if gallery_result:
+            return gallery_result
 
         return None
 
@@ -1860,12 +2085,28 @@ class VideoDownloaderMod(loader.Module):
                 age = int((time.time() - os.path.getmtime(path)) / 86400)
                 return f"✅ є ({age} дн. тому)"
             return "❌ відсутній"
+        _merge_platform_cookies()
+        statuses = _cookie_domains_status()
+        domains = "\n".join(
+            f"   {'✅' if ok else '❌'} {name}" for name, ok in statuses.items()
+        )
         await utils.answer(
             message,
             self.strings("cookies_status").format(
-                yt=_s(COOKIES_YOUTUBE), default=_s(COOKIES_DEFAULT)
+                yt=_s(COOKIES_YOUTUBE), default=_s(COOKIES_DEFAULT), domains=domains
             )
         )
+
+    @loader.command()
+    async def vdlupdate(self, message):
+        """Оновити yt-dlp до останньої версії"""
+        if self.config.get("auto_install_deps", True):
+            await self._ensure_runtime_dependencies()
+        ok, info = await self._auto_update_ytdlp(force=True)
+        if ok:
+            await utils.answer(message, self.strings("update_ok"))
+        else:
+            await utils.answer(message, self.strings("update_err").format(utils.escape_html(info)))
 
     @loader.command()
     async def vdlruntime(self, message):
