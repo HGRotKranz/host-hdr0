@@ -255,6 +255,27 @@ def _js_runtime_arg() -> str | None:
     return None
 
 
+def _js_runtime_opts(runtime: str | None) -> dict:
+    """Return yt-dlp Python API options for an explicit JS runtime.
+
+    ``--js-runtimes node:/path`` is a CLI option; the Python API expects a
+    top-level ``js_runtimes`` mapping.  Keeping this out of ``extractor_args``
+    is required for yt-dlp to actually detect Node/Deno/Bun/QuickJS.
+    """
+    if not runtime:
+        return {}
+    name, _, path = runtime.partition(":")
+    if not name:
+        return {}
+    runtime_cfg = {"path": path} if path else {}
+    opts = {"js_runtimes": {name: runtime_cfg}}
+    # Allow yt-dlp's EJS component loader to fetch challenge solver scripts
+    # when available. If the runtime has no network access, yt-dlp simply falls
+    # back to installed/local providers.
+    opts["remote_components"] = {"ejs:github"}
+    return opts
+
+
 @loader.tds
 class VideoDownloaderMod(loader.Module):
     """Автоматичне завантаження медіа з YouTube, TikTok, Instagram та ін. Фото відправляє альбомом."""
@@ -619,11 +640,28 @@ class VideoDownloaderMod(loader.Module):
             idx = 1
         return order[idx:]
 
-    def _build_yt_extractor_args(self, player_client: str) -> dict:
-        args: dict = {"youtube": {"player_client": [player_client]}}
-        if self._js_runtime:
-            args["youtube"]["js_runtimes"] = [self._js_runtime]
-        return args
+    def _build_yt_extractor_args(
+        self, player_clients: str | list[str], allow_missing_pot: bool = False
+    ) -> dict:
+        """Build yt-dlp YouTube extractor args compatible with recent YouTube changes.
+
+        yt-dlp expects player clients as separate values. Passing
+        ``"tv,tv_simply"`` as one value made newer yt-dlp releases treat it
+        as an unknown client. ``formats=missing_pot`` is reserved for fallback
+        attempts because those formats can still fail with HTTP 403, but it
+        lets yt-dlp try formats skipped when no PO token is available.
+        """
+        if isinstance(player_clients, str):
+            clients = [c.strip() for c in player_clients.split(",") if c.strip()]
+        else:
+            clients = [c.strip() for c in player_clients if c and c.strip()]
+
+        youtube_args: dict = {}
+        if clients:
+            youtube_args["player_client"] = clients
+        if allow_missing_pot:
+            youtube_args["formats"] = ["missing_pot"]
+        return {"youtube": youtube_args}
 
     def _find_audio_output(self, base_path: str, audio_fmt: str) -> str | None:
         """
@@ -1097,12 +1135,12 @@ class VideoDownloaderMod(loader.Module):
     def _try_ydl_format_youtube(
         self, url: str, base_name: str, fmt: str,
         audio: bool, cookies: str | None,
-        status_msg, loop, player_client: str
+        status_msg, loop, player_clients: str | list[str], allow_missing_pot: bool = False
     ) -> str | None:
         import yt_dlp
 
         audio_fmt = self.config["audio_format"]
-        extractor_args = self._build_yt_extractor_args(player_client)
+        extractor_args = self._build_yt_extractor_args(player_clients, allow_missing_pot)
 
         opts = {
             "format": fmt,
@@ -1119,6 +1157,7 @@ class VideoDownloaderMod(loader.Module):
             },
         }
         opts.update(self._fast_ytdlp_opts())
+        opts.update(_js_runtime_opts(self._js_runtime))
         if cookies:
             opts["cookiefile"] = cookies
 
@@ -1150,11 +1189,15 @@ class VideoDownloaderMod(loader.Module):
                 return _find_file(base_name)
 
         except yt_dlp.utils.DownloadError as e:
-            logger.warning("YT DownloadError fmt='%s' client=%s: %s",
-                           fmt, player_client, str(e)[:300])
+            client_label = ",".join(player_clients) if isinstance(player_clients, list) else player_clients
+            logger.warning(
+                "YT DownloadError fmt='%s' client=%s: %s",
+                fmt, client_label, str(e)[:300],
+            )
             _cleanup(base_name)
         except Exception as e:
-            logger.exception("YT error fmt='%s' client=%s: %s", fmt, player_client, e)
+            client_label = ",".join(player_clients) if isinstance(player_clients, list) else player_clients
+            logger.exception("YT error fmt='%s' client=%s: %s", fmt, client_label, e)
             _cleanup(base_name)
         return None
 
@@ -1171,17 +1214,29 @@ class VideoDownloaderMod(loader.Module):
             else self._youtube_format_chain(quality, vertical)
         )
 
-        for client in ("tv,tv_simply", "web_safari", "mweb"):
+        client_profiles = [
+            ("default_notv", ["default", "-tv"], False),
+            ("tv_simply", ["tv_simply", "default", "-tv"], False),
+            ("web_safari", ["web_safari"], False),
+            ("android_vr", ["android_vr"], False),
+            ("android", ["android"], False),
+            ("mweb", ["mweb"], False),
+            ("missing_pot", ["default", "ios", "web_embedded", "-tv"], True),
+        ]
+        for client_label, clients, allow_missing_pot in client_profiles:
             for fmt in fmt_chain[:4]:
                 result = await utils.run_sync(
                     self._try_ydl_format_youtube,
-                    url, f"{base_name}_{client.split(',')[0]}",
-                    fmt, audio, cookies, status_msg, loop, client
+                    url, f"{base_name}_{client_label}",
+                    fmt, audio, cookies, status_msg, loop, clients, allow_missing_pot
                 )
                 if result == "TOO_LARGE":
                     return "TOO_LARGE"
                 if result:
-                    logger.info("YT OK: client=%s fmt='%s'", client, fmt)
+                    logger.info(
+                        "YT OK: client=%s fmt='%s' missing_pot=%s",
+                        clients, fmt, allow_missing_pot,
+                    )
                     return result
 
         # Останній шанс — стандартний yt-dlp без extractor_args
@@ -1235,10 +1290,12 @@ class VideoDownloaderMod(loader.Module):
             opts["cookiefile"] = cookies
 
         u_lower = url.lower()
-        if ("youtube.com" in u_lower or "youtu.be" in u_lower) and self._js_runtime:
-            opts["extractor_args"] = {
-                "youtube": {"js_runtimes": [self._js_runtime]}
-            }
+        if "youtube.com" in u_lower or "youtu.be" in u_lower:
+            opts.update(_js_runtime_opts(self._js_runtime))
+            opts["extractor_args"] = self._build_yt_extractor_args(
+                ["default", "ios", "web_embedded", "-tv"],
+                allow_missing_pot=True,
+            )
 
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
@@ -1527,12 +1584,12 @@ class VideoDownloaderMod(loader.Module):
             if cookies:
                 opts["cookiefile"] = cookies
 
-            if ("youtube.com" in url or "youtu.be" in url) and self._js_runtime:
-                opts["extractor_args"] = {
-                    "youtube": {"js_runtimes": [self._js_runtime]}
-                }
-            else:
-                opts["extractor_args"] = {"youtube": {"formats": ["missing_pot"]}}
+            if "youtube.com" in url or "youtu.be" in url:
+                opts.update(_js_runtime_opts(self._js_runtime))
+                opts["extractor_args"] = self._build_yt_extractor_args(
+                    ["default", "ios", "web_embedded", "-tv"],
+                    allow_missing_pot=True,
+                )
 
             try:
                 with yt_dlp.YoutubeDL(opts) as ydl:
@@ -1694,10 +1751,12 @@ class VideoDownloaderMod(loader.Module):
             }
             if cookies:
                 opts["cookiefile"] = cookies
-            if self._js_runtime:
-                opts["extractor_args"] = {
-                    "youtube": {"js_runtimes": [self._js_runtime]}
-                }
+            if "youtube.com" in url or "youtu.be" in url:
+                opts.update(_js_runtime_opts(self._js_runtime))
+                opts["extractor_args"] = self._build_yt_extractor_args(
+                    ["default", "ios", "web_embedded", "-tv"],
+                    allow_missing_pot=True,
+                )
             with yt_dlp.YoutubeDL(opts) as ydl:
                 return ydl.extract_info(url, download=False)
 
