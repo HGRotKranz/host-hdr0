@@ -1,4 +1,4 @@
-__version__ = (5, 4, 0)
+__version__ = (6, 0, 0)
 
 import os
 import re
@@ -354,7 +354,7 @@ class VideoDownloaderMod(loader.Module):
         "caption_playlist":   "<b>📋 {title} ({idx}/{total})</b>",
         "transcript_header":  "<b>📝 Транскрипт: {title}</b>\n\n",
         "help_text": (
-            "<b>🎬 VideoDownloader v5.4.0</b>\n\n"
+            "<b>🎬 VideoDownloader v6.0.0</b>\n\n"
             "<b>Основні команди:</b>\n"
             "• <code>.vdl</code> — увімк/вимк авто-завантаження\n"
             "• <code>.vdldl [URL]</code> — ручне завантаження\n"
@@ -372,7 +372,7 @@ class VideoDownloaderMod(loader.Module):
             "<b>.vdlset [параметр] [значення]:</b>\n"
             "cooldown, limit, size, auto_delete,\n"
             "retries, queue_max, notify_dm,\n"
-            "playlist, playlist_max, audio_format, workers"
+            "playlist, playlist_max, audio_format, workers, cli, any_url, ipv4"
         ),
     }
 
@@ -404,6 +404,11 @@ class VideoDownloaderMod(loader.Module):
             loader.ConfigValue("auto_update_ytdlp", True, "Автоматично оновлювати yt-dlp раз на добу"),
             loader.ConfigValue("auto_install_deps", True, "Автоматично ставити відсутні бібліотеки"),
             loader.ConfigValue("use_gallery_dl",    True, "Fallback через gallery-dl для Reddit/Pinterest/X/Instagram тощо"),
+            loader.ConfigValue("use_cli_ytdlp",     True, "Використовувати універсальний yt-dlp CLI режим як у tuitube"),
+            loader.ConfigValue("force_ipv4",        False, "Додавати --force-ipv4 для yt-dlp CLI"),
+            loader.ConfigValue("allow_any_url",     True, "Автозавантажувати будь-які URL, які підтримує yt-dlp"),
+            loader.ConfigValue("yt_dlp_path",       "", "Шлях до yt-dlp binary (порожньо = auto/python -m yt_dlp)"),
+            loader.ConfigValue("ffmpeg_path",       "", "Шлях до ffmpeg або директорії з ffmpeg (порожньо = auto)"),
         )
         self._stats = {
             "total": 0, "ok": 0, "err": 0, "retried": 0,
@@ -1367,6 +1372,120 @@ class VideoDownloaderMod(loader.Module):
         return None
 
 
+    def _find_executable(self, configured: str, names: list[str]) -> str | None:
+        """Find an executable in config, PATH and common Homebrew/Linux paths."""
+        candidates: list[str] = []
+        if configured:
+            candidates.append(configured)
+        for name in names:
+            found = shutil.which(name)
+            if found:
+                candidates.append(found)
+        for base in ("/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"):
+            for name in names:
+                candidates.append(os.path.join(base, name))
+        for candidate in candidates:
+            if candidate and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                return candidate
+        return None
+
+    def _ytdlp_cli_prefix(self) -> list[str]:
+        configured = str(self.config.get("yt_dlp_path", "") or "").strip()
+        ytdlp = self._find_executable(configured, ["yt-dlp", "yt_dlp"])
+        return [ytdlp] if ytdlp else [sys.executable, "-m", "yt_dlp"]
+
+    def _ffmpeg_location(self) -> str | None:
+        configured = str(self.config.get("ffmpeg_path", "") or "").strip()
+        if configured:
+            return configured
+        ffmpeg = self._find_executable("", ["ffmpeg"])
+        return os.path.dirname(ffmpeg) if ffmpeg else None
+
+    def _tuitube_format_value(self, info: dict, audio: bool) -> tuple[str, str | None]:
+        if audio:
+            return "bestaudio/best", None
+        formats = info.get("formats") or []
+        for fmt in reversed(formats):
+            if fmt.get("vcodec") and fmt.get("vcodec") != "none":
+                fmt_id = fmt.get("format_id") or "best"
+                ext = fmt.get("ext") or "mp4"
+                has_audio = fmt.get("acodec") and fmt.get("acodec") != "none"
+                return fmt_id if has_audio else f"{fmt_id}+bestaudio", ext
+        return "bestvideo*+bestaudio/best", "mp4"
+
+    def _run_ytdlp_cli_sync(self, url: str, base_name: str, audio: bool) -> list[str] | str | None:
+        cmd = self._ytdlp_cli_prefix()
+        common = []
+        if self.config.get("force_ipv4", False):
+            common.append("--force-ipv4")
+        cookies = _get_cookies(url)
+        if cookies:
+            common += ["--cookies", cookies]
+        ffmpeg_location = self._ffmpeg_location()
+        if ffmpeg_location:
+            common += ["--ffmpeg-location", ffmpeg_location]
+
+        info_cmd = cmd + common + ["--no-playlist", "--dump-json", "--format-sort=resolution,ext,tbr", url]
+        try:
+            info_proc = subprocess.run(info_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=90, env={**os.environ, "PYTHONUNBUFFERED": "1"})
+        except Exception as e:
+            logger.warning("yt-dlp CLI info failed: %s", e)
+            return None
+        if info_proc.returncode != 0 or not info_proc.stdout.strip():
+            logger.warning("yt-dlp CLI info error: %s", (info_proc.stderr or info_proc.stdout)[-500:])
+            return None
+        try:
+            import json
+            info = json.loads(info_proc.stdout)
+        except Exception as e:
+            logger.warning("yt-dlp CLI JSON parse failed: %s", e)
+            return None
+        if info.get("live_status") not in (None, "not_live"):
+            logger.warning("Live streams are not supported by CLI fallback: %s", info.get("live_status"))
+            return None
+
+        outtmpl = f"{base_name}_cli_%(title).180B_%(id)s.%(ext)s"
+        dl_cmd = cmd + common + ["--no-playlist", "--newline", "--print", "after_move:filepath", "-o", outtmpl]
+        if audio:
+            dl_cmd += ["--format", self._tuitube_format_value(info, True)[0], "--extract-audio", "--audio-format", self.config.get("audio_format", "mp3")]
+        else:
+            fmt, recode = self._tuitube_format_value(info, False)
+            dl_cmd += ["--format", fmt]
+            if recode:
+                dl_cmd += ["--recode-video", recode]
+        max_size = int(self.config.get("max_size", 0) or 0)
+        if max_size > 0:
+            dl_cmd += ["--max-filesize", f"{max_size}M"]
+        try:
+            proc = subprocess.run(dl_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=int(self.config.get("task_timeout", _TASK_TIMEOUT)), env={**os.environ, "PYTHONUNBUFFERED": "1"})
+        except subprocess.TimeoutExpired:
+            return None
+        except Exception as e:
+            logger.warning("yt-dlp CLI download failed: %s", e)
+            return None
+        if proc.returncode != 0:
+            output = proc.stdout or ""
+            if "File is larger than max-filesize" in output or "exceeds limit" in output:
+                _cleanup(f"{base_name}_cli")
+                return "TOO_LARGE"
+            logger.warning("yt-dlp CLI error: %s", output[-700:])
+            _cleanup(f"{base_name}_cli")
+            return None
+        paths = []
+        for line in (proc.stdout or "").splitlines():
+            line = line.strip()
+            if os.path.isabs(line) and os.path.isfile(line) and os.path.getsize(line) > 0:
+                paths.append(line)
+        if not paths:
+            paths = [p for p in glob.glob(f"{base_name}_cli_*") if os.path.isfile(p) and os.path.getsize(p) > 0 and os.path.splitext(p)[1].lower() in VIDEO_EXTS | AUDIO_EXTS | IMAGE_EXTS]
+        return sorted(dict.fromkeys(paths)) or None
+
+    async def _dl_ytdlp_cli(self, url: str, base_name: str, audio: bool) -> list[str] | str | None:
+        if not self.config.get("use_cli_ytdlp", True):
+            return None
+        return await utils.run_sync(self._run_ytdlp_cli_sync, url, base_name, audio)
+
+
     def _pip_install_sync(self, packages: list[str], upgrade: bool = False) -> tuple[bool, str]:
         if not packages:
             return True, "nothing to install"
@@ -1557,6 +1676,12 @@ class VideoDownloaderMod(loader.Module):
                 return "TOO_LARGE"
             if result:
                 return [result]
+
+        cli_result = await self._dl_ytdlp_cli(url, base_name, audio)
+        if cli_result:
+            if cli_result == "TOO_LARGE":
+                return "TOO_LARGE"
+            return cli_result
 
         gallery_result = await self._dl_gallery_dl(url, base_name)
         if gallery_result:
@@ -1936,6 +2061,7 @@ class VideoDownloaderMod(loader.Module):
                 + [f"{base}_a{i}"  for i in range(self.config["retries"] + 1)]
                 + [f"{base}_{c}"   for c in yt_clients]
                 + [f"{base}_tk"]
+                + [f"{base}_cli"]
             )
             for b in all_bases:
                 _cleanup(b)
@@ -1960,7 +2086,8 @@ class VideoDownloaderMod(loader.Module):
         text = getattr(message, "raw_text", "") or ""
         if not text or text.startswith("."):
             return
-        if not any(h in text.lower() for h in SUPPORTED_HOSTS):
+        if (not self.config.get("allow_any_url", True)
+                and not any(h in text.lower() for h in SUPPORTED_HOSTS)):
             return
 
         url = self._extract_url(text)
@@ -2087,7 +2214,8 @@ class VideoDownloaderMod(loader.Module):
                 "workers (1-4 паралельних завантажень),\n"
                 "fix_orientation, playlist, playlist_max,\n"
                 "audio_format (mp3/m4a/wav/opus/flac),\n"
-                "timeout (сек, таймаут завдання)"
+                "timeout (сек, таймаут завдання),\n"
+                "cli, any_url, ipv4 (0/1)"
             )
         key, raw = args[0].lower(), args[1]
         mapping = {
@@ -2103,6 +2231,9 @@ class VideoDownloaderMod(loader.Module):
             "playlist":        ("playlist_enabled",  bool, ""),
             "playlist_max":    ("playlist_max",      int,  "відео"),
             "timeout":         ("task_timeout",      int,  "сек"),
+            "cli":             ("use_cli_ytdlp",    bool, ""),
+            "any_url":         ("allow_any_url",    bool, ""),
+            "ipv4":            ("force_ipv4",       bool, ""),
         }
         if key == "audio_format":
             valid = {"mp3", "m4a", "wav", "opus", "flac", "aac"}
