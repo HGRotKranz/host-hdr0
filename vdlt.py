@@ -227,17 +227,8 @@ def _normalize_youtube_url(url: str) -> str:
 
 def _detect_js_runtime() -> tuple[str, str] | None:
     candidates = [
-        # YouTube player challenges have been most reliable with this Deno
-        # binary, so prefer it over Node when it is installed.
-        ("deno",   [
-            PREFERRED_DENO_PATH, "/usr/bin/deno",
-            os.path.expanduser("~/.deno/bin/deno"),
-        ]),
-        ("node",   [
-            "/usr/bin/node", "/usr/local/bin/node",
-            "/usr/local/nvm/versions/node/current/bin/node",
-            "/root/.nvm/versions/node/current/bin/node",
-        ]),
+        ("deno", ["/usr/local/bin/deno", "/usr/bin/deno"]),
+        ("node", ["/usr/bin/node", "/usr/local/bin/node"]),
         ("nodejs", ["/usr/bin/nodejs", "/usr/local/bin/nodejs"]),
     ]
     for name, paths in candidates:
@@ -1434,9 +1425,8 @@ class VideoDownloaderMod(loader.Module):
         cookies = _get_cookies(url)
         if cookies:
             common += ["--cookies", cookies]
-        js_runtime = self._js_runtime or _preferred_js_runtime_arg()
-        if js_runtime:
-            common += ["--js-runtimes", js_runtime]
+        runtime = self._js_runtime or PREFERRED_JS_RUNTIME
+        common += ["--js-runtimes", runtime]
         ffmpeg_location = self._ffmpeg_location()
         if ffmpeg_location:
             common += ["--ffmpeg-location", ffmpeg_location]
