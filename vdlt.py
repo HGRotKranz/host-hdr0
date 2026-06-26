@@ -21,6 +21,8 @@ logger = logging.getLogger(__name__)
 COOKIES_DIR     = "/home/rkbot/URKbot/"
 COOKIES_DEFAULT = os.path.join(COOKIES_DIR, "cookies.txt")
 COOKIES_YOUTUBE = os.path.join(COOKIES_DIR, "cookies-youtube-com.txt")
+PREFERRED_DENO_PATH = "/usr/local/bin/deno"
+PREFERRED_JS_RUNTIME = f"deno:{PREFERRED_DENO_PATH}"
 
 PIP_DEPENDENCIES = {
     "yt-dlp": "yt_dlp",
@@ -225,16 +227,18 @@ def _normalize_youtube_url(url: str) -> str:
 
 def _detect_js_runtime() -> tuple[str, str] | None:
     candidates = [
+        # YouTube player challenges have been most reliable with this Deno
+        # binary, so prefer it over Node when it is installed.
+        ("deno",   [
+            PREFERRED_DENO_PATH, "/usr/bin/deno",
+            os.path.expanduser("~/.deno/bin/deno"),
+        ]),
         ("node",   [
             "/usr/bin/node", "/usr/local/bin/node",
             "/usr/local/nvm/versions/node/current/bin/node",
             "/root/.nvm/versions/node/current/bin/node",
         ]),
         ("nodejs", ["/usr/bin/nodejs", "/usr/local/bin/nodejs"]),
-        ("deno",   [
-            "/usr/bin/deno", "/usr/local/bin/deno",
-            os.path.expanduser("~/.deno/bin/deno"),
-        ]),
     ]
     for name, paths in candidates:
         for p in paths:
@@ -343,6 +347,8 @@ class VideoDownloaderMod(loader.Module):
             "<b>🍪 Cookies:</b> <code>cookies.txt</code>\n"
             "├ Файл: {default}\n"
             "├ Legacy YouTube: {yt}\n"
+            "├ Шлях: <code>/home/rkbot/URKbot/cookies.txt</code>\n"
+            "├ Порада: оновлюй cookies час від часу — YouTube може їх ротувати.\n"
             "└ Домени в cookies.txt:\n{domains}"
         ),
         "js_runtime_status":  "<b>🟢 JS Runtime: <code>{rt}</code></b>",
@@ -1220,9 +1226,9 @@ class VideoDownloaderMod(loader.Module):
         )
 
         client_profiles = [
-            ("default_notv", ["default", "-tv"], False),
-            ("tv_simply", ["tv_simply", "default", "-tv"], False),
             ("web_safari", ["web_safari"], False),
+            ("tv_simply", ["tv_simply", "default", "-tv"], False),
+            ("default_notv", ["default", "-tv"], False),
             ("android_vr", ["android_vr"], False),
             ("android", ["android"], False),
             ("mweb", ["mweb"], False),
@@ -1421,6 +1427,13 @@ class VideoDownloaderMod(loader.Module):
         cookies = _get_cookies(url)
         if cookies:
             common += ["--cookies", cookies]
+        js_runtime = (
+            PREFERRED_JS_RUNTIME
+            if os.path.isfile(PREFERRED_DENO_PATH)
+            else (self._js_runtime or _js_runtime_arg())
+        )
+        if js_runtime:
+            common += ["--js-runtimes", js_runtime]
         ffmpeg_location = self._ffmpeg_location()
         if ffmpeg_location:
             common += ["--ffmpeg-location", ffmpeg_location]
