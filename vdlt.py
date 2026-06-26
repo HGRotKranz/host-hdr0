@@ -1,4 +1,4 @@
-__version__ = (6, 0, 3)
+__version__ = (6, 0, 4)
 
 import os
 import re
@@ -163,6 +163,25 @@ def _is_youtube_auth_error(error: Exception | str) -> bool:
         "missing pot",
     )
     return any(marker in text for marker in markers)
+
+def _subprocess_env_for_cookie_owner() -> dict:
+    """Build an env for yt-dlp subprocesses that matches the cookie owner.
+
+    Manual YouTube checks are commonly run as the ``rkbot`` user.  When Hikka is
+    started with a different HOME, Deno/yt-dlp may miss the user's cached JS
+    runtime data even though the same command works from the shell.
+    """
+    env = {**os.environ, "PYTHONUNBUFFERED": "1"}
+    try:
+        if os.path.exists(COOKIES_DEFAULT):
+            import pwd
+
+            owner = pwd.getpwuid(os.stat(COOKIES_DEFAULT).st_uid)
+            if owner.pw_dir:
+                env["HOME"] = owner.pw_dir
+    except Exception as e:
+        logger.debug("Could not derive subprocess HOME from cookies owner: %s", e)
+    return env
 
 
 def _parse_browser_cookies(value: str | None) -> tuple | None:
@@ -1512,15 +1531,16 @@ class VideoDownloaderMod(loader.Module):
         browser_cookies = (self.config.get("yt_browser_cookies", "") or "").strip()
         if ("youtube.com" in url.lower() or "youtu.be" in url.lower()) and browser_cookies:
             common += ["--cookies-from-browser", browser_cookies]
-        runtime = self._js_runtime or PREFERRED_JS_RUNTIME
-        common += ["--js-runtimes", runtime]
+        runtime = self._js_runtime or _preferred_js_runtime_arg()
+        if runtime:
+            common += ["--js-runtimes", runtime]
         ffmpeg_location = self._ffmpeg_location()
         if ffmpeg_location:
             common += ["--ffmpeg-location", ffmpeg_location]
 
         info_cmd = cmd + common + ["--no-playlist", "--dump-json", "--format-sort=resolution,ext,tbr", url]
         try:
-            info_proc = subprocess.run(info_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=90, env={**os.environ, "PYTHONUNBUFFERED": "1"})
+            info_proc = subprocess.run(info_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=90, env=_subprocess_env_for_cookie_owner())
         except Exception as e:
             logger.warning("yt-dlp CLI info failed: %s", e)
             return None
@@ -1541,7 +1561,11 @@ class VideoDownloaderMod(loader.Module):
             logger.warning("Live streams are not supported by CLI fallback: %s", info.get("live_status"))
             return None
 
-        outtmpl = f"{base_name}_cli_%(title).180B_%(id)s.%(ext)s"
+        # Keep the CLI fallback output template intentionally simple.  Some
+        # yt-dlp builds/plugins are stricter about advanced template specifiers,
+        # while the user's known-good manual command only relies on standard
+        # yt-dlp options.
+        outtmpl = f"{base_name}_cli_%(id)s.%(ext)s"
         dl_cmd = cmd + common + ["--no-playlist", "--newline", "--print", "after_move:filepath", "-o", outtmpl]
         if audio:
             dl_cmd += ["--format", self._tuitube_format_value(info, True)[0], "--extract-audio", "--audio-format", self.config.get("audio_format", "mp3")]
@@ -1554,7 +1578,7 @@ class VideoDownloaderMod(loader.Module):
         if max_size > 0:
             dl_cmd += ["--max-filesize", f"{max_size}M"]
         try:
-            proc = subprocess.run(dl_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=int(self.config.get("task_timeout", _TASK_TIMEOUT)), env={**os.environ, "PYTHONUNBUFFERED": "1"})
+            proc = subprocess.run(dl_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=int(self.config.get("task_timeout", _TASK_TIMEOUT)), env=_subprocess_env_for_cookie_owner())
         except subprocess.TimeoutExpired:
             return None
         except Exception as e:
