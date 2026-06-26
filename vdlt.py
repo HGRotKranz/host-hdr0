@@ -1,4 +1,4 @@
-__version__ = (6, 0, 1)
+__version__ = (6, 0, 3)
 
 import os
 import re
@@ -150,6 +150,38 @@ def _get_cookies(url: str) -> str | None:
     return None
 
 
+
+
+def _is_youtube_auth_error(error: Exception | str) -> bool:
+    text = str(error).lower()
+    markers = (
+        "sign in to confirm",
+        "not a bot",
+        "cookies-from-browser",
+        "getpot",
+        "po token",
+        "missing pot",
+    )
+    return any(marker in text for marker in markers)
+
+
+def _parse_browser_cookies(value: str | None) -> tuple | None:
+    """Parse yt-dlp cookies-from-browser config.
+
+    Accepts the same compact form users know from yt-dlp CLI, for example:
+    ``chrome``, ``firefox:/path/to/profile`` or ``chrome:Default``.
+    """
+    raw = (value or "").strip()
+    if not raw:
+        return None
+    parts = [part.strip() or None for part in raw.split(":", 3)]
+    browser = parts[0]
+    if not browser:
+        return None
+    while len(parts) < 4:
+        parts.append(None)
+    return tuple(parts[:4])
+
 def _find_file(base_name: str) -> str | None:
     for ext in ("mp4", "mp3", "webm", "mkv", "m4a", "ogg", "opus",
                 "jpg", "jpeg", "png", "gif", "webp", "bmp", "wav", "aac", "flac"):
@@ -292,6 +324,7 @@ class VideoDownloaderMod(loader.Module):
         "loading_fix":        "<b>🔧 Виправляю орієнтацію відео...</b>",
         "loading_transcript": "<b>📝 Витягую транскрипт...</b>",
         "err_file":           "<b>❌ Не вдалося отримати файл.</b>",
+        "err_youtube_auth":   "<b>❌ YouTube просить підтвердити, що це не бот. Онови cookies: <code>.vdlcookies</code> і поклади актуальний Netscape cookies.txt у <code>/home/rkbot/URKbot/cookies.txt</code>, або задай <code>.vdlset yt_browser_cookies chrome</code>/<code>firefox</code> на хості з браузером.</b>",
         "err_size":           "<b>❌ Файл завеликий ({} МБ). Знижую якість...</b>",
         "err_size_final":     "<b>❌ Файл завеликий навіть у найнижчій якості.</b>",
         "err_limit":          "<b>🚫 Денний ліміт ({} завантажень) вичерпано.</b>",
@@ -413,6 +446,7 @@ class VideoDownloaderMod(loader.Module):
             loader.ConfigValue("allow_any_url",     True, "Автозавантажувати будь-які URL, які підтримує yt-dlp"),
             loader.ConfigValue("yt_dlp_path",       "", "Шлях до yt-dlp binary (порожньо = auto/python -m yt_dlp)"),
             loader.ConfigValue("ffmpeg_path",       "", "Шлях до ffmpeg або директорії з ffmpeg (порожньо = auto)"),
+            loader.ConfigValue("yt_browser_cookies", "", "YouTube cookies-from-browser для yt-dlp: chrome/firefox або browser:profile"),
         )
         self._stats = {
             "total": 0, "ok": 0, "err": 0, "retried": 0,
@@ -1141,6 +1175,15 @@ class VideoDownloaderMod(loader.Module):
 
     # ── YouTube ───────────────────────────────────────────────────────────────
 
+    def _apply_browser_cookies(self, opts: dict, url: str) -> None:
+        if "youtube.com" not in url.lower() and "youtu.be" not in url.lower():
+            return
+        browser_cookies = _parse_browser_cookies(
+            self.config.get("yt_browser_cookies", "")
+        )
+        if browser_cookies:
+            opts["cookiesfrombrowser"] = browser_cookies
+
     def _try_ydl_format_youtube(
         self, url: str, base_name: str, fmt: str,
         audio: bool, cookies: str | None,
@@ -1169,6 +1212,7 @@ class VideoDownloaderMod(loader.Module):
         opts.update(_js_runtime_opts(self._js_runtime))
         if cookies:
             opts["cookiefile"] = cookies
+        self._apply_browser_cookies(opts, url)
 
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
@@ -1199,6 +1243,13 @@ class VideoDownloaderMod(loader.Module):
 
         except yt_dlp.utils.DownloadError as e:
             client_label = ",".join(player_clients) if isinstance(player_clients, list) else player_clients
+            if _is_youtube_auth_error(e):
+                logger.warning(
+                    "YT auth/POT challenge fmt='%s' client=%s; cookies=%s browser_cookies=%s",
+                    fmt, client_label, bool(cookies), bool(self.config.get("yt_browser_cookies", "")),
+                )
+                _cleanup(base_name)
+                return "AUTH_REQUIRED"
             logger.warning(
                 "YT DownloadError fmt='%s' client=%s: %s",
                 fmt, client_label, str(e)[:300],
@@ -1239,8 +1290,8 @@ class VideoDownloaderMod(loader.Module):
                     url, f"{base_name}_{client_label}",
                     fmt, audio, cookies, status_msg, loop, clients, allow_missing_pot
                 )
-                if result == "TOO_LARGE":
-                    return "TOO_LARGE"
+                if result in ("TOO_LARGE", "AUTH_REQUIRED"):
+                    return result
                 if result:
                     logger.info(
                         "YT OK: client=%s fmt='%s' missing_pot=%s",
@@ -1297,6 +1348,7 @@ class VideoDownloaderMod(loader.Module):
         opts.update(self._fast_ytdlp_opts())
         if cookies:
             opts["cookiefile"] = cookies
+        self._apply_browser_cookies(opts, url)
 
         u_lower = url.lower()
         if "youtube.com" in u_lower or "youtu.be" in u_lower:
@@ -1333,6 +1385,10 @@ class VideoDownloaderMod(loader.Module):
                 return _find_file(base_name)
 
         except yt_dlp.utils.DownloadError as e:
+            if ("youtube.com" in url.lower() or "youtu.be" in url.lower()) and _is_youtube_auth_error(e):
+                logger.warning("YouTube auth/POT challenge url=%s fmt='%s'", url, fmt)
+                _cleanup(base_name)
+                return "AUTH_REQUIRED"
             logger.warning("DownloadError url=%s fmt='%s': %s", url, fmt, str(e)[:200])
             _cleanup(base_name)
         except Exception as e:
@@ -1377,10 +1433,21 @@ class VideoDownloaderMod(loader.Module):
 
 
     def _find_executable(self, configured: str, names: list[str]) -> str | None:
-        """Find an executable in config, PATH and common Homebrew/Linux paths."""
+        """Find an executable in config, Hikka venv, PATH and common system paths."""
         candidates: list[str] = []
         if configured:
             candidates.append(configured)
+            if os.path.isdir(configured):
+                for name in names:
+                    candidates.append(os.path.join(configured, name))
+
+        # Prefer Hikka's own virtualenv binary when present. The module runs
+        # inside Hikka, and users commonly test yt-dlp successfully through
+        # /home/rkbot/hikka/.venv/bin/yt-dlp even when PATH points elsewhere.
+        for base in ("/home/rkbot/hikka/.venv/bin",):
+            for name in names:
+                candidates.append(os.path.join(base, name))
+
         for name in names:
             found = shutil.which(name)
             if found:
@@ -1409,13 +1476,30 @@ class VideoDownloaderMod(loader.Module):
         if audio:
             return "bestaudio/best", None
         formats = info.get("formats") or []
+
+        def _is_real_video(fmt: dict) -> bool:
+            return (
+                bool(fmt.get("format_id"))
+                and fmt.get("vcodec") not in (None, "none")
+                and not fmt.get("has_drm")
+                and fmt.get("ext") not in ("mhtml", "images")
+            )
+
+        # Prefer progressive files first. They are the same family that usually
+        # succeeds in manual ``yt-dlp -F`` checks with cookies and do not require
+        # a second audio request that may hit YouTube POT restrictions.
         for fmt in reversed(formats):
-            if fmt.get("vcodec") and fmt.get("vcodec") != "none":
-                fmt_id = fmt.get("format_id") or "best"
+            if _is_real_video(fmt) and fmt.get("acodec") not in (None, "none"):
+                fmt_id = fmt.get("format_id")
                 ext = fmt.get("ext") or "mp4"
-                has_audio = fmt.get("acodec") and fmt.get("acodec") != "none"
-                return fmt_id if has_audio else f"{fmt_id}+bestaudio", ext
-        return "bestvideo*+bestaudio/best", "mp4"
+                return fmt_id, ext
+
+        for fmt in reversed(formats):
+            if _is_real_video(fmt):
+                fmt_id = fmt.get("format_id")
+                ext = fmt.get("ext") or "mp4"
+                return f"{fmt_id}+bestaudio/best", ext
+        return "best[ext=mp4]/bestvideo*+bestaudio/best", "mp4"
 
     def _run_ytdlp_cli_sync(self, url: str, base_name: str, audio: bool) -> list[str] | str | None:
         cmd = self._ytdlp_cli_prefix()
@@ -1425,6 +1509,9 @@ class VideoDownloaderMod(loader.Module):
         cookies = _get_cookies(url)
         if cookies:
             common += ["--cookies", cookies]
+        browser_cookies = (self.config.get("yt_browser_cookies", "") or "").strip()
+        if ("youtube.com" in url.lower() or "youtu.be" in url.lower()) and browser_cookies:
+            common += ["--cookies-from-browser", browser_cookies]
         runtime = self._js_runtime or PREFERRED_JS_RUNTIME
         common += ["--js-runtimes", runtime]
         ffmpeg_location = self._ffmpeg_location()
@@ -1438,7 +1525,11 @@ class VideoDownloaderMod(loader.Module):
             logger.warning("yt-dlp CLI info failed: %s", e)
             return None
         if info_proc.returncode != 0 or not info_proc.stdout.strip():
-            logger.warning("yt-dlp CLI info error: %s", (info_proc.stderr or info_proc.stdout)[-500:])
+            info_err = info_proc.stderr or info_proc.stdout
+            if _is_youtube_auth_error(info_err):
+                logger.warning("yt-dlp CLI YouTube auth/POT challenge; cookies=%s browser_cookies=%s", bool(cookies), bool(browser_cookies))
+                return "AUTH_REQUIRED"
+            logger.warning("yt-dlp CLI info error: %s", info_err[-500:])
             return None
         try:
             import json
@@ -1474,6 +1565,10 @@ class VideoDownloaderMod(loader.Module):
             if "File is larger than max-filesize" in output or "exceeds limit" in output:
                 _cleanup(f"{base_name}_cli")
                 return "TOO_LARGE"
+            if _is_youtube_auth_error(output):
+                logger.warning("yt-dlp CLI YouTube auth/POT challenge during download")
+                _cleanup(f"{base_name}_cli")
+                return "AUTH_REQUIRED"
             logger.warning("yt-dlp CLI error: %s", output[-700:])
             _cleanup(f"{base_name}_cli")
             return None
@@ -1631,6 +1726,12 @@ class VideoDownloaderMod(loader.Module):
                 return gallery_result
 
         if "youtube.com" in u or "youtu.be" in u:
+            cli_result = await self._dl_ytdlp_cli(url, base_name, audio)
+            if cli_result and cli_result not in ("AUTH_REQUIRED", "TOO_LARGE"):
+                return cli_result if isinstance(cli_result, list) else [cli_result]
+            if cli_result == "TOO_LARGE":
+                return "TOO_LARGE"
+
             steps = self._quality_steps() if not audio else ["best"]
             max_retries = self.config["retries"]
 
@@ -1653,9 +1754,17 @@ class VideoDownloaderMod(loader.Module):
                         )
                         continue
                     return "TOO_LARGE"
+                if result == "AUTH_REQUIRED":
+                    await status_msg.edit(self.strings("err_youtube_auth"))
+                    return None
                 if result:
                     return [result]
 
+            cli_result = await self._dl_ytdlp_cli(url, base_name, audio)
+            if cli_result and cli_result != "AUTH_REQUIRED":
+                return cli_result if isinstance(cli_result, list) else [cli_result]
+            if cli_result == "AUTH_REQUIRED":
+                await status_msg.edit(self.strings("err_youtube_auth"))
             return None
 
         vertical = _is_vertical_url(url)
