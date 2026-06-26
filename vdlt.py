@@ -1,4 +1,4 @@
-__version__ = (6, 0, 0)
+__version__ = (6, 0, 1)
 
 import os
 import re
@@ -259,6 +259,13 @@ def _js_runtime_arg() -> str | None:
     return None
 
 
+def _preferred_js_runtime_arg() -> str | None:
+    """Prefer the known-good Deno binary for YouTube player challenges."""
+    if os.path.isfile(PREFERRED_DENO_PATH) and os.access(PREFERRED_DENO_PATH, os.X_OK):
+        return PREFERRED_JS_RUNTIME
+    return _js_runtime_arg()
+
+
 def _js_runtime_opts(runtime: str | None) -> dict:
     """Return yt-dlp Python API options for an explicit JS runtime.
 
@@ -428,7 +435,7 @@ class VideoDownloaderMod(loader.Module):
         self._worker_task = None
         self._worker_tasks: list[asyncio.Task] = []
         self._client = None
-        self._js_runtime: str | None = _js_runtime_arg()
+        self._js_runtime: str | None = _preferred_js_runtime_arg()
         if self._js_runtime:
             logger.info("VideoDownloader: JS runtime detected: %s", self._js_runtime)
         else:
@@ -1427,11 +1434,7 @@ class VideoDownloaderMod(loader.Module):
         cookies = _get_cookies(url)
         if cookies:
             common += ["--cookies", cookies]
-        js_runtime = (
-            PREFERRED_JS_RUNTIME
-            if os.path.isfile(PREFERRED_DENO_PATH)
-            else (self._js_runtime or _js_runtime_arg())
-        )
+        js_runtime = self._js_runtime or _preferred_js_runtime_arg()
         if js_runtime:
             common += ["--js-runtimes", js_runtime]
         ffmpeg_location = self._ffmpeg_location()
