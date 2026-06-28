@@ -1,4 +1,4 @@
-# meta developer: @RotKranz (enhanced)
+# meta developer: @RotKranz 
 # meta syntax: .mistral | .mistralimg | .mistralagent | .mistralagentadd
 
 __version__ = (4, 1, 1)
