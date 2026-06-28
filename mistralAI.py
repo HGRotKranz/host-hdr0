@@ -1,7 +1,7 @@
 # meta developer: @RotKranz 
 # meta syntax: .mistral | .mistralimg | .mistralagent | .mistralagentadd
 
-__version__ = (4, 3, 0)
+__version__ = (4, 3, 1)
 
 import asyncio
 import base64
@@ -16,6 +16,7 @@ import re
 import subprocess
 import sys
 import time
+from urllib.parse import quote
 from typing import Dict, List, Optional, Tuple
 
 import aiohttp
@@ -79,6 +80,13 @@ _TRIGGER_WORDS = {
 }
 
 _STREAM_UPDATE_INTERVAL = 0.8
+_IMAGE_AGENT_INSTRUCTIONS = (
+    "You are Lyra, a visual storyteller. When a user asks for an image, "
+    "craft a concise, vivid scene description in Ukrainian or English and use "
+    "the image_generation tool to produce it. Avoid technical jargon unless "
+    "the user explicitly asks for it."
+)
+_IMAGE_COMPLETION_ARGS = {"temperature": 0.3, "top_p": 0.95}
 
 # ── Werwolf: які дії підтримуються ───────────────────────────────────────────
 # Агент може вставити у відповідь тег [WERWOLF:дія:параметр]
@@ -585,12 +593,25 @@ class MistralModule(loader.Module):
             loader.ConfigValue("embed_model",         "mistral-embed",       "Модель ембединів"),
             loader.ConfigValue(
                 "image_model", "mistral-medium-latest",
-                "Модель/агент для генерації зображень через Conversations API",
+                "Модель для Mistral image_generation агента",
+            ),
+            loader.ConfigValue(
+                "image_agent_id", "",
+                "ID Mistral-агента з image_generation (порожньо = створити автоматично)",
             ),
             loader.ConfigValue(
                 "image_prompt_prefix",
                 "Generate a high-quality image. Return the generated image file.",
                 "Додаткова інструкція для .mistralimg",
+            ),
+            loader.ConfigValue(
+                "image_fallback_enabled", True,
+                "Якщо Mistral не повернув файл — генерувати через HTTP fallback",
+                validator=loader.validators.Boolean(),
+            ),
+            loader.ConfigValue(
+                "image_fallback_base_url", "https://image.pollinations.ai",
+                "HTTP fallback для генерації зображень (сумісний з /prompt/{prompt})",
             ),
         )
 
@@ -1175,18 +1196,72 @@ class MistralModule(loader.Module):
                 resolved_images.append(img)
         return text, resolved_images
 
+    async def _ensure_image_agent(self) -> str | None:
+        agent_id = str(self.config["image_agent_id"] or "").strip()
+        if agent_id:
+            return agent_id
+        if not self._ok():
+            return None
+
+        agent = await self._agent_create(
+            name="Lyra Image Agent",
+            model=self.config["image_model"],
+            instructions=_IMAGE_AGENT_INSTRUCTIONS,
+            tools=[TOOL_IMAGE_GEN],
+            description="Generates vivid images for the Telegram bot.",
+            completion_args=_IMAGE_COMPLETION_ARGS,
+        )
+        agent_id = agent.get("id")
+        if not agent_id:
+            raise RuntimeError("створення image-агента не повернуло ID")
+        self.config["image_agent_id"] = agent_id
+        return agent_id
+
     async def _generate_image(self, prompt: str) -> tuple[str, list[bytes]]:
         image_prompt = f"{self.config['image_prompt_prefix']}\n\nUser prompt: {prompt}"
-        return await self._conversation(
-            prompt=image_prompt,
-            tools=[TOOL_IMAGE_GEN],
-            model=self.config["image_model"],
-            instructions=(
-                "You are an image generation assistant. Use the image_generation "
-                "tool whenever the user asks for an image, illustration, logo, "
-                "sticker, avatar, concept art, or visual variation."
-            ),
-        )
+        text = ""
+        images: list[bytes] = []
+
+        if self._ok():
+            try:
+                agent_id = await self._ensure_image_agent()
+                if agent_id:
+                    text, images = await self._conversation(
+                        prompt=image_prompt,
+                        agent_id=agent_id,
+                    )
+            except RuntimeError:
+                if not self.config["image_fallback_enabled"]:
+                    raise
+                logger.warning("Mistral image generation failed; trying HTTP fallback", exc_info=True)
+
+        if not images and self.config["image_fallback_enabled"]:
+            fallback = await self._generate_image_via_http(prompt)
+            if fallback:
+                images = [fallback]
+                if not text:
+                    text = "Згенеровано через HTTP fallback."
+
+        return text, images
+
+    async def _generate_image_via_http(self, prompt: str) -> bytes | None:
+        base_url = str(self.config["image_fallback_base_url"] or "").strip().rstrip("/")
+        if not base_url:
+            return None
+        encoded = quote(prompt.strip(), safe="")
+        url = f"{base_url}/prompt/{encoded}?n=1&size=1024x1024&model=flux"
+        try:
+            async with self._session.get(url, timeout=self._to()) as r:
+                data = await r.read()
+                if r.status != 200:
+                    logger.warning("Image HTTP fallback failed (%s): %s", r.status, data[:200])
+                    return None
+                return data or None
+        except asyncio.TimeoutError:
+            logger.warning("Image HTTP fallback timed out for prompt: %s", prompt)
+        except Exception as e:
+            logger.warning("Image HTTP fallback error for prompt %s: %s", prompt, e)
+        return None
 
     # ── API: Platform Agents CRUD ──────────────────────────────────────────────
 
@@ -1197,10 +1272,21 @@ class MistralModule(loader.Module):
     async def _agent_get(self, agent_id: str) -> dict:
         return await self._get(f"/v1/agents/{agent_id}")
 
-    async def _agent_create(self, name: str, model: str, instructions: str,
-                             tools: list | None = None) -> dict:
+    async def _agent_create(
+        self,
+        name: str,
+        model: str,
+        instructions: str,
+        tools: list | None = None,
+        description: str | None = None,
+        completion_args: dict | None = None,
+    ) -> dict:
         payload = {"name": name, "model": model, "instructions": instructions,
                    "tools": tools or []}
+        if description:
+            payload["description"] = description
+        if completion_args:
+            payload["completion_args"] = completion_args
         return await self._post("/v1/agents", payload)
 
     async def _agent_update(self, agent_id: str, **kwargs) -> dict:
@@ -1633,7 +1719,7 @@ class MistralModule(loader.Module):
     @loader.command(ru_doc="<промт> — Згенерувати зображення через Mistral")
     async def mistralimg(self, message):
         """<промт> — Генерація зображення"""
-        if not self._ok():
+        if not self._ok() and not self.config["image_fallback_enabled"]:
             return await utils.answer(message, self.strings["no_api_key"])
         prompt = utils.get_args_raw(message).strip()
         if not prompt:
