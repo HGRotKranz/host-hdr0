@@ -1,11 +1,12 @@
 # meta developer: @RotKranz 
 # meta syntax: .mistral | .mistralimg | .mistralagent | .mistralagentadd
 
-__version__ = (4, 1, 1)
+__version__ = (4, 3, 0)
 
 import asyncio
 import base64
 import collections
+import html
 import importlib
 import io
 import json
@@ -117,7 +118,12 @@ _WW_TAG_RE = re.compile(r"\[WERWOLF:(\w+):([^\]]*)\]")
 
 # ── Markdown → HTML ───────────────────────────────────────────────────────────
 
+def _html_escape(text) -> str:
+    return html.escape(str(text or ""), quote=False)
+
+
 def _md_to_html(text: str) -> str:
+    text = _html_escape(text)
     text = re.sub(
         r"```(\w+)?\n?(.*?)```",
         lambda m: f"<pre><code>{m.group(2).strip()}</code></pre>",
@@ -130,7 +136,6 @@ def _md_to_html(text: str) -> str:
                   lambda m: f"<i>{m.group(1) or m.group(2)}</i>", text)
     text = re.sub(r"^#{1,3}\s+(.+)$", r"<b>\1</b>", text, flags=re.MULTILINE)
     return text.strip()
-
 
 def _detect_lang(text: str) -> str:
     if not _HAS_LANGDETECT or not text.strip():
@@ -163,26 +168,56 @@ def _cosine_similarity(a: list, b: list) -> float:
 
 
 def _parse_conversation_output(data: dict) -> tuple[str, list[bytes]]:
+    """Extract text, image URLs/base64 and Mistral tool file IDs from Conversations."""
     texts: list[str] = []
     images: list[bytes] = []
-    for output in data.get("outputs", []):
-        content = output.get("content", "")
-        if isinstance(content, str):
-            texts.append(content)
-        elif isinstance(content, list):
-            for chunk in content:
-                ctype = chunk.get("type", "")
-                if ctype == "text":
-                    texts.append(chunk.get("text", ""))
-                elif ctype == "image_url":
-                    img = chunk.get("image_url", "")
-                    url = img if isinstance(img, str) else img.get("url", "")
-                    if url.startswith("data:"):
-                        b64 = url.split(",", 1)[-1]
-                        images.append(base64.b64decode(b64))
-                    elif url:
-                        images.append(url.encode())
-    return "\n".join(texts).strip(), images
+
+    def add_image_url(url: str):
+        if not url:
+            return
+        if url.startswith("data:"):
+            b64 = url.split(",", 1)[-1]
+            images.append(base64.b64decode(b64))
+        else:
+            images.append(url.encode())
+
+    def walk(obj):
+        if isinstance(obj, str):
+            return
+        if isinstance(obj, list):
+            for item in obj:
+                walk(item)
+            return
+        if not isinstance(obj, dict):
+            return
+
+        ctype = obj.get("type", "")
+        if ctype in {"text", "output_text"} and obj.get("text"):
+            texts.append(str(obj.get("text")))
+        elif ctype in {"message.output", "message"}:
+            pass
+        elif ctype in {"image_url", "input_image"}:
+            img = obj.get("image_url") or obj.get("url") or ""
+            add_image_url(img if isinstance(img, str) else img.get("url", ""))
+        elif ctype in {"tool_file", "file"}:
+            file_id = obj.get("file_id") or obj.get("id")
+            tool = obj.get("tool") or obj.get("source") or ""
+            file_type = str(obj.get("file_type") or obj.get("mime_type") or "").lower()
+            if file_id and (
+                tool == "image_generation"
+                or file_type in {
+                    "png", "jpg", "jpeg", "webp",
+                    "image/png", "image/jpeg", "image/webp",
+                }
+            ):
+                images.append(f"mistral-file://{file_id}".encode())
+
+        for key in ("content", "outputs", "chunks", "data"):
+            if key in obj and obj[key] is not obj:
+                walk(obj[key])
+
+    walk(data.get("outputs", []))
+    return "\n".join(t for t in texts if t).strip(), images
 
 
 # ── Werwolf форматери (компактні) ─────────────────────────────────────────────
@@ -493,6 +528,31 @@ class MistralModule(loader.Module):
                 validator=loader.validators.Boolean(),
             ),
             loader.ConfigValue(
+                "agent_limit_daily", 10,
+                "Максимум авто-відповідей на день для 1 групи/OP-користувача (0 = без ліміту)",
+                validator=loader.validators.Integer(minimum=0, maximum=10000),
+            ),
+            loader.ConfigValue(
+                "agent_limit_monthly", 80,
+                "Максимум авто-відповідей на місяць для 1 групи/OP-користувача (0 = без ліміту)",
+                validator=loader.validators.Integer(minimum=0, maximum=100000),
+            ),
+            loader.ConfigValue(
+                "agent_limit_exempt_chats",
+                "-1003988122379,-1003321833550",
+                "Chat IDs груп без лімітів через кому",
+            ),
+            loader.ConfigValue(
+                "agent_limit_exempt_titles",
+                "Хелп група",
+                "Назви груп без лімітів через кому",
+            ),
+            loader.ConfigValue(
+                "agent_limit_exempt_users",
+                "7818078126",
+                "User IDs без лімітів через кому; власник Hikka також завжди без ліміту",
+            ),
+            loader.ConfigValue(
                 "vector_memory", False,
                 "Векторна пам'ять (потребує numpy)",
                 validator=loader.validators.Boolean(),
@@ -524,8 +584,13 @@ class MistralModule(loader.Module):
             loader.ConfigValue("transcription_model", "voxtral-mini-2507",   "Модель транскрипції"),
             loader.ConfigValue("embed_model",         "mistral-embed",       "Модель ембединів"),
             loader.ConfigValue(
-                "image_model", "mistral-large-latest",
-                "Модель для генерації зображень",
+                "image_model", "mistral-medium-latest",
+                "Модель/агент для генерації зображень через Conversations API",
+            ),
+            loader.ConfigValue(
+                "image_prompt_prefix",
+                "Generate a high-quality image. Return the generated image file.",
+                "Додаткова інструкція для .mistralimg",
             ),
         )
 
@@ -575,6 +640,82 @@ class MistralModule(loader.Module):
     def _save_active_agent(self):
         self.db.set("MistralAI", "active_agent_id",   self._active_agent_id   or "")
         self.db.set("MistralAI", "active_agent_name", self._active_agent_name or "")
+
+
+    def _csv_ints(self, value) -> set[int]:
+        result = set()
+        for item in str(value or "").replace(";", ",").split(","):
+            item = item.strip()
+            if not item:
+                continue
+            try:
+                result.add(int(item))
+            except ValueError:
+                logger.warning("MistralAI: некоректний ID у списку лімітів: %s", item)
+        return result
+
+    def _csv_titles(self, value) -> set[str]:
+        return {item.strip().casefold() for item in str(value or "").split(",") if item.strip()}
+
+    def _limit_periods(self) -> tuple[str, str]:
+        now = time.gmtime()
+        return time.strftime("%Y-%m-%d", now), time.strftime("%Y-%m", now)
+
+    def _limit_scope(
+        self,
+        chat_id: int,
+        sender_id: int,
+        is_group: bool,
+        group_title: str | None = None,
+    ) -> str | None:
+        if self._me and sender_id == self._me.id:
+            return None
+        if sender_id in self._csv_ints(self.config["agent_limit_exempt_users"]):
+            return None
+        if is_group:
+            if chat_id in self._csv_ints(self.config["agent_limit_exempt_chats"]):
+                return None
+            if group_title and group_title.casefold() in self._csv_titles(self.config["agent_limit_exempt_titles"]):
+                return None
+            return f"group:{chat_id}"
+        return f"user:{sender_id}"
+
+    def _limit_state(self) -> dict:
+        state = self.db.get("MistralAI", "agent_limits", {})
+        return state if isinstance(state, dict) else {}
+
+    def _limit_allowed(self, scope: str | None) -> bool:
+        if not scope:
+            return True
+        daily = int(self.config["agent_limit_daily"] or 0)
+        monthly = int(self.config["agent_limit_monthly"] or 0)
+        if daily <= 0 and monthly <= 0:
+            return True
+        day, month = self._limit_periods()
+        item = self._limit_state().get(scope, {})
+        day_count = item.get("day_count", 0) if item.get("day") == day else 0
+        month_count = item.get("month_count", 0) if item.get("month") == month else 0
+        if daily > 0 and day_count >= daily:
+            return False
+        if monthly > 0 and month_count >= monthly:
+            return False
+        return True
+
+    def _limit_inc(self, scope: str | None):
+        if not scope:
+            return
+        day, month = self._limit_periods()
+        state = self._limit_state()
+        item = state.get(scope, {})
+        day_count = item.get("day_count", 0) if item.get("day") == day else 0
+        month_count = item.get("month_count", 0) if item.get("month") == month else 0
+        state[scope] = {
+            "day": day,
+            "day_count": day_count + 1,
+            "month": month,
+            "month_count": month_count + 1,
+        }
+        self.db.set("MistralAI", "agent_limits", state)
 
     def _get_plain_mem(self, chat_id: int) -> collections.deque:
         """Пам'ять для чату — завжди спільна.
@@ -732,6 +873,25 @@ class MistralModule(loader.Module):
 
     # ── Low-level HTTP з retry ─────────────────────────────────────────────────
 
+    async def _read_json_response(self, response) -> dict:
+        body = await response.text()
+        try:
+            data = json.loads(body) if body else {}
+        except json.JSONDecodeError:
+            if response.status >= 400:
+                raise RuntimeError(f"HTTP {response.status}: {body[:300]}")
+            raise RuntimeError(f"Некоректний JSON від API: {body[:300]}")
+
+        if response.status >= 400:
+            err = data.get("error", data) if isinstance(data, dict) else data
+            msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
+            raise RuntimeError(f"HTTP {response.status}: {msg}")
+        if isinstance(data, dict) and "error" in data:
+            err = data["error"]
+            msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
+            raise RuntimeError(msg)
+        return data
+
     async def _post(self, path: str, payload: dict, headers: dict | None = None) -> dict:
         url = f"{BASE_URL}{path}"
         h = headers or self._h()
@@ -742,16 +902,13 @@ class MistralModule(loader.Module):
                 async with self._session.post(
                     url, json=payload, headers=h, timeout=self._to()
                 ) as r:
-                    data = await r.json()
-                if "error" in data:
-                    err = data["error"]
-                    msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
-                    raise RuntimeError(msg)
-                return data
+                    return await self._read_json_response(r)
             except asyncio.TimeoutError:
                 last_err = RuntimeError(f"таймаут ({self.config['timeout']}с)")
-            except RuntimeError:
-                raise
+            except RuntimeError as e:
+                if "HTTP 5" not in str(e) or attempt >= retries:
+                    raise
+                last_err = e
             except Exception as e:
                 last_err = RuntimeError(str(e))
             if attempt < retries:
@@ -765,6 +922,8 @@ class MistralModule(loader.Module):
         async with self._session.post(
             url, json=payload, headers=self._h(), timeout=self._to()
         ) as r:
+            if r.status >= 400:
+                await self._read_json_response(r)
             async for line in r.content:
                 line = line.decode("utf-8").strip()
                 if not line.startswith("data:"):
@@ -784,19 +943,38 @@ class MistralModule(loader.Module):
     async def _get(self, path: str) -> dict:
         url = f"{BASE_URL}{path}"
         async with self._session.get(url, headers=self._h(), timeout=self._to()) as r:
-            return await r.json()
+            return await self._read_json_response(r)
+
+    async def _download_file(self, file_id: str) -> bytes:
+        """Download a generated file from Mistral Files API."""
+        last_error = None
+        for path in (f"/v1/files/{file_id}/content", f"/v1/files/{file_id}/download"):
+            url = f"{BASE_URL}{path}"
+            try:
+                async with self._session.get(url, headers=self._h(), timeout=self._to()) as r:
+                    body = await r.read()
+                    if r.status < 400:
+                        return body
+                    last_error = RuntimeError(
+                        f"Files HTTP {r.status}: {body[:200].decode(errors='ignore')}"
+                    )
+            except RuntimeError as e:
+                last_error = e
+            except Exception as e:
+                last_error = RuntimeError(str(e))
+        raise last_error or RuntimeError("не вдалося завантажити файл")
 
     async def _delete(self, path: str) -> dict:
         url = f"{BASE_URL}{path}"
         async with self._session.delete(url, headers=self._h(), timeout=self._to()) as r:
-            return await r.json()
+            return await self._read_json_response(r)
 
     async def _patch(self, path: str, payload: dict) -> dict:
         url = f"{BASE_URL}{path}"
         async with self._session.patch(
             url, json=payload, headers=self._h(), timeout=self._to()
         ) as r:
-            return await r.json()
+            return await self._read_json_response(r)
 
     # ── API: Chat ──────────────────────────────────────────────────────────────
 
@@ -987,13 +1165,27 @@ class MistralModule(loader.Module):
         if instructions:
             payload["instructions"] = instructions
         data = await self._post("/v1/conversations", payload)
-        return _parse_conversation_output(data)
+        text, images = _parse_conversation_output(data)
+        resolved_images = []
+        for img in images:
+            if img.startswith(b"mistral-file://"):
+                file_id = img.decode().split("://", 1)[1]
+                resolved_images.append(await self._download_file(file_id))
+            else:
+                resolved_images.append(img)
+        return text, resolved_images
 
     async def _generate_image(self, prompt: str) -> tuple[str, list[bytes]]:
+        image_prompt = f"{self.config['image_prompt_prefix']}\n\nUser prompt: {prompt}"
         return await self._conversation(
-            prompt=prompt,
+            prompt=image_prompt,
             tools=[TOOL_IMAGE_GEN],
             model=self.config["image_model"],
+            instructions=(
+                "You are an image generation assistant. Use the image_generation "
+                "tool whenever the user asks for an image, illustration, logo, "
+                "sticker, avatar, concept art, or visual variation."
+            ),
         )
 
     # ── API: Platform Agents CRUD ──────────────────────────────────────────────
@@ -1141,6 +1333,12 @@ class MistralModule(loader.Module):
         except Exception:
             sender_name = str(sender_id)
 
+        # ── Ліміти авто-відповідей ───────────────────────────────────────
+        # Для груп ліміт рахується на чат; для OP/особистих — на користувача.
+        limit_scope = self._limit_scope(chat_id, sender_id, is_group, group_title)
+        if not self._limit_allowed(limit_scope):
+            return
+
         # ── Спільна пам'ять чату ──────────────────────────────────────────
         # Одна deque на весь чат (і для груп, і для особистих).
         # В групах content зберігається як '[Ім'я]: текст'.
@@ -1217,6 +1415,7 @@ class MistralModule(loader.Module):
                 logger.warning("Werwolf process error: %s", e)
 
         self._stats.inc()
+        self._limit_inc(limit_scope)
 
         # ── Зберігаємо відповідь у пам'ять ───────────────────────────────
         history.append({"role": ROLE_ASSISTANT, "content": reply_text})
@@ -1346,13 +1545,13 @@ class MistralModule(loader.Module):
             await utils.answer(
                 msg,
                 self.strings["chat_answer"].format(
-                    question=args, answer=_md_to_html(text),
+                    question=_html_escape(args), answer=_md_to_html(text),
                     model=model_label, time=elapsed,
                 ),
             )
         except RuntimeError as e:
             self._stats.inc(ok=False)
-            await utils.answer(msg, self.strings["error"].format(error=e))
+            await utils.answer(msg, self.strings["error"].format(error=_html_escape(e)))
 
     @loader.command(ru_doc="<питання> — Запитати з контекстом реплаю")
     async def mistralask(self, message):
@@ -1394,13 +1593,13 @@ class MistralModule(loader.Module):
             await utils.answer(
                 msg,
                 self.strings["chat_answer"].format(
-                    question=question, answer=_md_to_html(text),
+                    question=_html_escape(question), answer=_md_to_html(text),
                     model=model_label, time=elapsed,
                 ),
             )
         except RuntimeError as e:
             self._stats.inc(ok=False)
-            await utils.answer(msg, self.strings["error"].format(error=e))
+            await utils.answer(msg, self.strings["error"].format(error=_html_escape(e)))
 
     @loader.command(ru_doc="<модель> <питання> — Чат із конкретною моделлю")
     async def mistralm(self, message):
@@ -1421,13 +1620,13 @@ class MistralModule(loader.Module):
             await utils.answer(
                 msg,
                 self.strings["chat_answer"].format(
-                    question=prompt.strip(), answer=_md_to_html(text),
+                    question=_html_escape(prompt.strip()), answer=_md_to_html(text),
                     model=used, time=elapsed,
                 ),
             )
         except RuntimeError as e:
             self._stats.inc(ok=False)
-            await utils.answer(msg, self.strings["error"].format(error=e))
+            await utils.answer(msg, self.strings["error"].format(error=_html_escape(e)))
 
     # ── Генерація зображень ────────────────────────────────────────────────────
 
@@ -1445,8 +1644,13 @@ class MistralModule(loader.Module):
             self._stats.inc()
             text, images = await self._generate_image(prompt)
             if not images:
-                return await utils.answer(msg, self.strings["img_no_result"])
-            caption = self.strings["img_caption"].format(prompt=prompt)
+                details = f"\n\n<i>{_md_to_html(text)}</i>" if text else ""
+                return await utils.answer(msg, self.strings["img_no_result"] + details)
+            caption = self.strings["img_caption"].format(prompt=_html_escape(prompt))
+            if text:
+                caption = f"{caption}\n\n{_md_to_html(text)}"
+            if len(caption) > 1024:
+                caption = caption[:1018] + "…"
             for img in images:
                 if img.startswith(b"http"):
                     await message.client.send_file(
@@ -1459,7 +1663,7 @@ class MistralModule(loader.Module):
             await msg.delete()
         except RuntimeError as e:
             self._stats.inc(ok=False)
-            await utils.answer(msg, self.strings["error"].format(error=e))
+            await utils.answer(msg, self.strings["error"].format(error=_html_escape(e)))
 
     # ── Mistral Platform Agents ────────────────────────────────────────────────
 
@@ -1486,7 +1690,7 @@ class MistralModule(loader.Module):
                 text = text[:4090] + "\n..."
             await utils.answer(msg, text)
         except RuntimeError as e:
-            await utils.answer(msg, self.strings["error"].format(error=e))
+            await utils.answer(msg, self.strings["error"].format(error=_html_escape(e)))
 
     @loader.command(ru_doc="<agent_id> — Вибрати активного Mistral-агента")
     async def mistraluse(self, message):
@@ -1512,7 +1716,7 @@ class MistralModule(loader.Module):
                 self.strings["agent_set"].format(id=info["id"], name=info.get("name", "?")),
             )
         except RuntimeError as e:
-            await utils.answer(msg, self.strings["error"].format(error=e))
+            await utils.answer(msg, self.strings["error"].format(error=_html_escape(e)))
 
     @loader.command(ru_doc="<agent_id> — Інфо про Mistral-агента")
     async def mistralагентinfo(self, message):
@@ -1535,7 +1739,7 @@ class MistralModule(loader.Module):
                 ),
             )
         except RuntimeError as e:
-            await utils.answer(msg, self.strings["error"].format(error=e))
+            await utils.answer(msg, self.strings["error"].format(error=_html_escape(e)))
 
     @loader.command(ru_doc="<назва> | <модель> | <інструкція> | [tools] — Створити агента")
     async def mistralcreate(self, message):
@@ -1568,7 +1772,7 @@ class MistralModule(loader.Module):
                 self.strings["agent_created"].format(id=agent["id"], name=agent.get("name", name)),
             )
         except RuntimeError as e:
-            await utils.answer(msg, self.strings["error"].format(error=e))
+            await utils.answer(msg, self.strings["error"].format(error=_html_escape(e)))
 
     @loader.command(ru_doc="<agent_id> — Видалити Mistral-агента")
     async def mistraldelete(self, message):
@@ -1587,7 +1791,7 @@ class MistralModule(loader.Module):
                 self._save_active_agent()
             await utils.answer(msg, self.strings["agent_deleted"].format(id=agent_id))
         except RuntimeError as e:
-            await utils.answer(msg, self.strings["error"].format(error=e))
+            await utils.answer(msg, self.strings["error"].format(error=_html_escape(e)))
 
     # ── Авто-агент ────────────────────────────────────────────────────────────
 
@@ -1692,7 +1896,7 @@ class MistralModule(loader.Module):
                 text = text[:4090] + "\n..."
             await utils.answer(msg, text)
         except RuntimeError as e:
-            await utils.answer(msg, self.strings["error"].format(error=e))
+            await utils.answer(msg, self.strings["error"].format(error=_html_escape(e)))
 
     @loader.command(ru_doc="— OCR зображення або PDF")
     async def mistralocr(self, message):
@@ -1712,12 +1916,14 @@ class MistralModule(loader.Module):
                 )
             else:
                 return await utils.answer(msg, self.strings["ocr_no_media"])
-            output = self.strings["ocr_result"].format(text=result or "<i>(текст не знайдено)</i>")
+            output = self.strings["ocr_result"].format(
+                text=_md_to_html(result) if result else "<i>(текст не знайдено)</i>"
+            )
             if len(output) > 4096:
                 output = output[:4090] + "\n..."
             await utils.answer(msg, output)
         except RuntimeError as e:
-            await utils.answer(msg, self.strings["error"].format(error=e))
+            await utils.answer(msg, self.strings["error"].format(error=_html_escape(e)))
 
     @loader.command(ru_doc="<текст> — Синтез мовлення (TTS)")
     async def mistralvoice(self, message):
@@ -1737,7 +1943,7 @@ class MistralModule(loader.Module):
             )
             await msg.delete()
         except RuntimeError as e:
-            await utils.answer(msg, self.strings["error"].format(error=e))
+            await utils.answer(msg, self.strings["error"].format(error=_html_escape(e)))
 
     @loader.command(ru_doc="— Транскрипція аудіо")
     async def mistraltranscribe(self, message):
@@ -1754,10 +1960,12 @@ class MistralModule(loader.Module):
             text  = await self._transcribe(audio, fname)
             await utils.answer(
                 msg,
-                self.strings["transcription"].format(text=text or "<i>(не розпізнано)</i>"),
+                self.strings["transcription"].format(
+                    text=_html_escape(text) if text else "<i>(не розпізнано)</i>"
+                ),
             )
         except RuntimeError as e:
-            await utils.answer(msg, self.strings["error"].format(error=e))
+            await utils.answer(msg, self.strings["error"].format(error=_html_escape(e)))
 
     @loader.command(ru_doc="<текст> — Ембединг тексту")
     async def mistralembed(self, message):
@@ -1778,7 +1986,7 @@ class MistralModule(loader.Module):
                 ),
             )
         except RuntimeError as e:
-            await utils.answer(msg, self.strings["error"].format(error=e))
+            await utils.answer(msg, self.strings["error"].format(error=_html_escape(e)))
 
     @loader.command(ru_doc="<текст> — Модерація тексту")
     async def mistralmod(self, message):
@@ -1802,7 +2010,7 @@ class MistralModule(loader.Module):
                 ),
             )
         except RuntimeError as e:
-            await utils.answer(msg, self.strings["error"].format(error=e))
+            await utils.answer(msg, self.strings["error"].format(error=_html_escape(e)))
 
     @loader.command(ru_doc="— Статистика використання")
     async def mistralstats(self, message):
@@ -1842,14 +2050,15 @@ class MistralModule(loader.Module):
         )
         await utils.answer(
             message,
-            f"<b>🤖 MistralAI v4.1 — команди:</b>{active}{deps}\n\n"
+            f"<b>🤖 MistralAI v4.3 — команди:</b>{active}{deps}\n\n"
             "<b>💬 Чат</b>\n"
             "<code>.mistral &lt;питання&gt;</code> — Чат\n"
             "<code>.mistralask [питання]</code> — Чат з контекстом реплаю\n"
             "<code>.mistralm &lt;модель&gt; &lt;питання&gt;</code> — Конкретна модель\n"
             "<code>.mistralmodels</code> — Список моделей\n\n"
             "<b>🎨 Зображення</b>\n"
-            "<code>.mistralimg &lt;промт&gt;</code> — Генерація зображення\n\n"
+            "<code>.mistralimg &lt;промт&gt;</code> — Генерація зображення через image_generation tool\n"
+            "<i>Порада: налаштуй image_model та image_prompt_prefix у .config MistralAI</i>\n\n"
             "<b>🤖 Mistral Platform Agents</b>\n"
             "<code>.mistralagents</code> — Список агентів\n"
             "<code>.mistraluse &lt;agent_id&gt;</code> — Вибрати агента\n"
@@ -1860,7 +2069,8 @@ class MistralModule(loader.Module):
             "<b>👻 Авто-агент</b>\n"
             "<code>.mistralauto</code> — Увімк/вимк у чаті\n"
             "<code>.mistralautolist</code> — Активні чати\n"
-            "<code>.mistralclear</code> — Очистити пам'ять\n\n"
+            "<code>.mistralclear</code> — Очистити пам'ять\n"
+            "<i>Ліміти авто-відповідей: 10/день і 80/місяць на групу або OP-користувача; винятки у .config</i>\n\n"
             "<b>🎮 Werwolf інтеграція</b>\n"
             "<code>.wwkey &lt;ключ&gt;</code> — Встановити Werwolf ключ\n"
             "<code>.wwtest</code> — Перевірити підключення\n"
