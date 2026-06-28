@@ -43,6 +43,21 @@ SUPPORTED_HOSTS = [
     "soundcloud.com/", "snapchat.com/", "likee.video/", "kwai.com/",
 ]
 
+def _hostname_matches(hostname: str, domain: str) -> bool:
+    domain = domain.lower().strip().strip("/")
+    hostname = hostname.lower().strip().lstrip("www.")
+    return hostname == domain or hostname.endswith(f".{domain}")
+
+
+def _is_supported_url(url: str) -> bool:
+    try:
+        hostname = (urlsplit(url).netloc or "").lower().lstrip("www.")
+    except Exception:
+        return False
+    if not hostname:
+        return False
+    return any(_hostname_matches(hostname, host) for host in SUPPORTED_HOSTS)
+
 COOKIE_DOMAINS = {
     "YouTube": ("youtube.com", "youtu.be", "googlevideo.com"),
     "Instagram": ("instagram.com", "instagr.am", "threads.net"),
@@ -462,7 +477,7 @@ class VideoDownloaderMod(loader.Module):
             loader.ConfigValue("use_gallery_dl",    True, "Fallback через gallery-dl для Reddit/Pinterest/X/Instagram тощо"),
             loader.ConfigValue("use_cli_ytdlp",     True, "Використовувати універсальний yt-dlp CLI режим як у tuitube"),
             loader.ConfigValue("force_ipv4",        False, "Додавати --force-ipv4 для yt-dlp CLI"),
-            loader.ConfigValue("allow_any_url",     True, "Автозавантажувати будь-які URL, які підтримує yt-dlp"),
+            loader.ConfigValue("allow_any_url",     False, "Автозавантажувати будь-які URL, які підтримує yt-dlp"),
             loader.ConfigValue("yt_dlp_path",       "", "Шлях до yt-dlp binary (порожньо = auto/python -m yt_dlp)"),
             loader.ConfigValue("ffmpeg_path",       "", "Шлях до ffmpeg або директорії з ffmpeg (порожньо = auto)"),
             loader.ConfigValue("yt_browser_cookies", "", "YouTube cookies-from-browser для yt-dlp: chrome/firefox або browser:profile"),
@@ -1791,6 +1806,11 @@ class VideoDownloaderMod(loader.Module):
                 await status_msg.edit(self.strings("err_youtube_auth"))
             return None
 
+        if (not self.config.get("allow_any_url", False)
+                and not _is_supported_url(url)):
+            logger.info("Skipping unsupported URL with allow_any_url disabled: %s", url)
+            return None
+
         vertical = _is_vertical_url(url)
         steps = self._quality_steps() if not audio else ["best"]
         max_retries = self.config["retries"]
@@ -2120,7 +2140,8 @@ class VideoDownloaderMod(loader.Module):
         try:
             result = await self._download(url, base, status_msg, audio)
 
-            if result is None:
+            if (result is None and (self.config.get("allow_any_url", False)
+                    or _is_supported_url(url))):
                 await status_msg.edit(self.strings("loading_photo"))
                 direct = await self._try_direct(url, base)
                 if direct:
@@ -2225,14 +2246,13 @@ class VideoDownloaderMod(loader.Module):
         text = getattr(message, "raw_text", "") or ""
         if not text or text.startswith("."):
             return
-        if (not self.config.get("allow_any_url", True)
-                and not any(h in text.lower() for h in SUPPORTED_HOSTS)):
-            return
-
         url = self._extract_url(text)
         if not url:
             return
         url = self._normalize(url)
+        if (not self.config.get("allow_any_url", False)
+                and not _is_supported_url(url)):
+            return
 
         cd = self._cooldown_left()
         if cd:
