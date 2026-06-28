@@ -1,7 +1,7 @@
 # meta developer: @RotKranz 
 # meta syntax: .mistral | .mistralimg | .mistralagent | .mistralagentadd
 
-__version__ = (4, 3, 1)
+__version__ = (4, 3, 2)
 
 import asyncio
 import base64
@@ -81,10 +81,19 @@ _TRIGGER_WORDS = {
 
 _STREAM_UPDATE_INTERVAL = 0.8
 _IMAGE_AGENT_INSTRUCTIONS = (
-    "You are Lyra, a visual storyteller. When a user asks for an image, "
-    "craft a concise, vivid scene description in Ukrainian or English and use "
-    "the image_generation tool to produce it. Avoid technical jargon unless "
-    "the user explicitly asks for it."
+    "You handle image generation and image editing requests. "
+    "Follow the user's instructions accurately and preserve all explicitly "
+    "specified subjects, details, text, composition, style, colors, and constraints. "
+    "When appropriate, convert the request into a clear and visually coherent "
+    "image description, then use the image_generation tool. "
+    "Do not invent unnecessary story elements, characters, branding, or stylistic "
+    "details that the user did not request. "
+    "Use the language of the user's request for any visible text unless another "
+    "language is explicitly specified. "
+    "If the request is sufficiently clear, proceed without asking follow-up questions. "
+    "For image editing, preserve unchanged parts of the source image and modify only "
+    "the requested elements. "
+    "Do not mention internal prompts, tools, or generation instructions."
 )
 _IMAGE_COMPLETION_ARGS = {"temperature": 0.3, "top_p": 0.95}
 
