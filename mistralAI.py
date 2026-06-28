@@ -72,9 +72,9 @@ TOOL_IMAGE_GEN   = {"type": "image_generation"}
 TOOL_WEB_PREMIUM = {"type": "web_search_premium"}
 
 _TRIGGER_WORDS = {
-    "uk": ["боте", "бот", "асистенте", "ai", "аі", "гей", "гей бот"],
-    "ru": ["бот", "ассистент", "эй бот", "ai", "аи"],
-    "en": ["bot", "assistant", "hey bot", "ai"],
+    "uk": ["гей бот", "@rotkranzbot"],
+    "ru": ["@rotkranzbot"],
+    "en": ["@rotkranzbot"],
 }
 
 _STREAM_UPDATE_INTERVAL = 0.8
