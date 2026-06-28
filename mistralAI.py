@@ -1,7 +1,7 @@
 # meta developer: @RotKranz (enhanced)
 # meta syntax: .mistral | .mistralimg | .mistralagent | .mistralagentadd
 
-__version__ = (4, 1, 0)
+__version__ = (4, 1, 1)
 
 import asyncio
 import base64
